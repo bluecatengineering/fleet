@@ -6,5 +6,18 @@ showVarDu() {
 	du -sxm /var/log/sdp /var/log/journal /var/lib/docker /var/cache/apt
 }
 
-showDiskspace
+showDf2() {
+	df -h / /boot /tmp /var /home
+}
+
+showDiskspace2() {
+	echo current disk space
+	showDf2
+	du -sxm /home/* | sort -nr
+	du -sxm /home/sdp/* | sort -nr | head -4
+	du -sxm /home/sdp/nomad/alloc/* | sort -nr | head -4
+	du -sxm /var/lib/docker/* | sort -nr | head -4
+}
+
 showVarDu
+showDiskspace2

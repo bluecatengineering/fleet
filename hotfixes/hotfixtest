@@ -2,4 +2,9 @@
 #
 # hotfixtest - hotfix test
 
-showDf
+showVarDu() {
+	du -sxm /var/log/sdp /var/log/journal /var/lib/docker /var/cache/apt
+}
+
+showDiskSpace
+showVarDu

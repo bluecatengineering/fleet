@@ -18,18 +18,18 @@ patchBSLD() {
 		echo failed to download $hotfixRaw/$package
 		exit 1
 	fi
-	ls -l $packageFullPath
+
 	echo patching BSLD
 	dpkg -i $packageFullPath
 	echo restarting BSLD
 	systemctl restart bsld
 	echo waiting for BSLD to become healthy
 	sleep 2
-	status=`curl -s -m 5 -w "%{http_code}" http://localhost:8082/api/v1/health`
+	status=`curl -s -m 1 -w "%{http_code}" http://localhost:8082/api/v1/health`
 	while test "$status" != 200; do
-		echo status is $status, checking in 10 seconds
+		echo status is $status, checking in 5 seconds
 		sleep 5
-		status=`curl -s -m 5 -w "%{http_code}" http://localhost:8082/api/v1/health`
+		status=`curl -s -m 1 -w "%{http_code}" http://localhost:8082/api/v1/health`
 	done
 	echo status is $status, BSLD is healthy
 }

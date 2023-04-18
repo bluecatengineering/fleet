@@ -20,8 +20,14 @@ patchBSLD() {
 	echo restarting BSLD
 	systemctl restart bsld
 	echo waiting for BSLD to become healthy
-	sleep 30
-	curl localhost:8082/api/v1/health
+	# sleep 2
+	status=`curl -s -m 5 -w "%{http_code}" http://localhost:8082/api/v1/health`
+	while test "$status" != 200; do
+		echo status is $status, checking in 10 seconds
+		sleep 10
+		status=`curl -s -m 5 -w "%{http_code}" http://localhost:8082/api/v1/health`
+	done
+	echo BSLD is healthy
 }
 
 # remove the hotfix so it will get re-downloaded each time for dev testing

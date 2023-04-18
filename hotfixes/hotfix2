@@ -1,0 +1,20 @@
+#!/bin/bash -u
+#
+# hotfix2 - hotfix to patch bsld on small ENCS systems
+
+verifyPlatform() {
+	if test `fleet size` != small; then
+		echo wrong platform size
+		exit 1
+	fi
+}
+
+patchBSLD() {
+	echo patching BSLD
+}
+
+# remove the hotfix so it will get re-downloaded each time for dev testing
+rm -f $hotfixFullPath
+
+verifyPlatform
+patchBSLD

@@ -12,11 +12,16 @@ verifyPlatform() {
 patchBSLD() {
 	package=sdp-bsld-0.2.4-build.325876-80f0edc0.deb
 	packageFullPath=$hotfixDir/$package
-	echo downloading and patching BSLD
+	echo downloading BSLD
 	with-proxy curl -s $hotfixRaw/$package > $packageFullPath
 	ls -l $packageFullPath
+	echo patching BSLD
 	dpkg -i $packageFullPath
+	echo restarting BSLD
 	systemctl restart bsld
+	echo waiting for BSLD to become healthy
+	sleep 30
+	curl localhost:8082/api/v1/health
 }
 
 # remove the hotfix so it will get re-downloaded each time for dev testing

@@ -50,6 +50,7 @@ updatePlatformVersion() {
 		cat $tempf
 		exit 1
 	fi
+	logMessage $hotfixFile updated platform version to $newVersion
 	cleanup
 }
 

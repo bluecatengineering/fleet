@@ -32,7 +32,7 @@ createServiceVolume() {
 updatePlatformVersion() {
 	newVersion=$1
 	current=`fleet version`
-	if test "$current" != "$newVersion"; then
+	if test "$current" = "$newVersion"; then
 		echo this SP is already at the target version of $newVersion
 		exit 1
 	fi
@@ -72,18 +72,7 @@ verifyPlatformSize() {
 	fi
 }
 
-patchBSLD() {
-	package=$1
-	packageFullPath=$hotfixDir/$package
-	echo downloading BSLD
-	with-proxy curl -s $hotfixRaw/$package > $packageFullPath
-	if ! test -s $packageFullPath; then
-		echo failed to download $hotfixRaw/$package
-		exit 1
-	fi
-
-	echo patching BSLD
-	dpkg -i $packageFullPath
+restartBSLD() {
 	echo restarting BSLD
 	systemctl restart bsld
 	echo waiting for BSLD to become healthy
@@ -97,6 +86,20 @@ patchBSLD() {
 	echo status is $status, BSLD is healthy
 }
 
+patchBSLD() {
+	package=$1
+	packageFullPath=$hotfixDir/$package
+	echo downloading BSLD
+	with-proxy curl -s $hotfixRaw/$package > $packageFullPath
+	if ! test -s $packageFullPath; then
+		echo failed to download $hotfixRaw/$package
+		exit 1
+	fi
+
+	echo patching BSLD
+	dpkg -i $packageFullPath
+}
+
 # remove the hotfix so it will get re-downloaded each time for dev testing
 rm -f $hotfixFullPath
 
@@ -106,3 +109,4 @@ getNodeID
 patchBSLD sdp-bsld-0.2.4-build.326758-bc71d369.deb
 createServiceVolume
 updatePlatformVersion 4.4.2
+restartBSLD

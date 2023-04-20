@@ -1,16 +1,78 @@
 #!/bin/bash -u
 #
-# hotfix2 - hotfix to patch bsld on small ENCS systems
+# hotfix2 - hotfix to patch bsld on SP 4.4.1 systems
 
-verifyPlatform() {
-	if test `fleet size` != small; then
-		echo wrong platform size
+export PATH=$PATH:/opt/bluecat/bin
+tempf=/tmp/hotfix.$USER.$$
+
+cleanup() {
+	rm -f $tempf
+}
+
+getNodeID() {
+	nodeID=`grep nodeID /opt/bluecat/bsld/conf/node.conf | awk '{print $2}' | sed s/\"//g | sed s/,//`
+	if test -z "$nodeID"; then
+		echo failed to get nodeID
+		exit 1
+	fi
+}
+
+createServiceVolume() {
+	docker ps | grep sdp-demo > $tempf
+	if test -s $tempf; then
+		echo creating extra service volume to simulate DRS running on this SP
+		if test `fleet size` = small; then
+			service-volume create test1Gig 1024
+		else
+			service-volume create test10Gig 10240
+		fi
+	fi
+}
+
+updatePlatformVersion() {
+	newVersion=$1
+	current=`fleet version`
+	if test "$current" != "$newVersion"; then
+		echo this SP is already at the target version of $newVersion
+		exit 1
+	fi
+
+	source /root/.bashrc
+
+	if test -z "$nodeID"; then
+		echo failed to get nodeID
+		exit 1
+	fi
+	consulPATH=fleet/node/$nodeID/version
+	without-proxy consul kv put $consulPATH "$newVersion" | grep -v Success > $tempf
+	if test -s $tempf; then
+		echo got error setting SP version to $newVersion:
+		cat $tempf
+		exit 1
+	fi
+	cleanup
+}
+
+verifyPlatformVersion() {
+	required=$1
+	current=`fleet version`
+	if test "$current" != "$required"; then
+		echo wrong SP platform version, expected $required but got $current
+		exit 1
+	fi
+}
+
+verifyPlatformSize() {
+	required=$1
+	current=`fleet size`
+	if test "$current" != "$required"; then
+		echo wrong SP platform size, expected $required but got $current
 		exit 1
 	fi
 }
 
 patchBSLD() {
-	package=sdp-bsld-0.2.4-build.325876-80f0edc0.deb
+	package=$1
 	packageFullPath=$hotfixDir/$package
 	echo downloading BSLD
 	with-proxy curl -s $hotfixRaw/$package > $packageFullPath
@@ -37,5 +99,9 @@ patchBSLD() {
 # remove the hotfix so it will get re-downloaded each time for dev testing
 rm -f $hotfixFullPath
 
-verifyPlatform
-patchBSLD
+verifyPlatformVersion 4.4.1
+verifyPlatformSize small
+getNodeID
+patchBSLD sdp-bsld-0.2.4-build.326758-bc71d369.deb
+createServiceVolume
+updatePlatformVersion 4.4.2

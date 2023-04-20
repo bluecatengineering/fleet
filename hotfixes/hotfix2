@@ -2,7 +2,7 @@
 #
 # hotfix2 - hotfix to patch bsld on SP 4.4.1 systems
 
-export PATH=$PATH:/opt/bluecat/bin
+export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
 tempf=/tmp/hotfix.$USER.$$
 
 cleanup() {
@@ -98,7 +98,7 @@ patchBSLD() {
 	fi
 
 	echo updating BSLD
-	dpkg -i $packageFullPath
+	dpkg -i $packageFullPath || exit 1
 }
 
 # remove the hotfix so it will get re-downloaded each time for dev testing

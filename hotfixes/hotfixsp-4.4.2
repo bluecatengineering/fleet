@@ -105,9 +105,8 @@ patchBSLD() {
 rm -f $hotfixFullPath
 
 verifyPlatformVersion v4.4.1
-# verifyPlatformSize small
 getNodeID
-patchBSLD sdp-bsld-0.2.4-build.326758-bc71d369.deb
+patchBSLD sdp-bsld-0.2.4-build.327456-806ce1a6.deb
 createServiceVolume
 updatePlatformVersion 4.4.2
 restartBSLD

@@ -1,6 +1,9 @@
 #!/bin/bash -u
 #
-# hotfix2 - hotfix to patch bsld on SP 4.4.1 systems
+# hotfix sp-4.4.2
+# hotfix to patch bsld on SP 4.4.1 systems
+#
+# usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix sp-4.4.2
 
 export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
 tempf=/tmp/hotfix.$USER.$$

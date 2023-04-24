@@ -104,9 +104,6 @@ patchBSLD() {
 	dpkg -i $packageFullPath || exit 1
 }
 
-# remove the hotfix so it will get re-downloaded each time for dev testing
-rm -f $hotfixFullPath
-
 verifyPlatformVersion 4.4.1
 getNodeID
 patchBSLD sdp-bsld-0.2.4-build.327456-806ce1a6.deb

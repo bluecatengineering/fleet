@@ -1,0 +1,112 @@
+#!/bin/bash -u
+#
+# hotfix sp-4.4.2
+# hotfix to patch bsld on SP 4.4.1 systems
+#
+# usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix sp-4.4.2
+
+export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
+tempf=/tmp/hotfix.$USER.$$
+
+cleanup() {
+	rm -f $tempf
+}
+
+getNodeID() {
+	nodeID=`grep nodeID /opt/bluecat/bsld/conf/node.conf | awk '{print $2}' | sed s/\"//g | sed s/,//`
+	if test -z "$nodeID"; then
+		echo failed to get nodeID
+		exit 1
+	fi
+}
+
+createServiceVolume() {
+	docker ps | grep sdp-demo > $tempf
+	if test -s $tempf; then
+		echo creating extra service volume to simulate DRS running on this SP
+		if test `fleet size` = small; then
+			service-volume create test1Gig 1024
+		else
+			service-volume create test10Gig 10240
+		fi
+	fi
+}
+
+updatePlatformVersion() {
+	newVersion=$1
+	current=`fleet version`
+	if test "$current" = "$newVersion"; then
+		echo this SP is already at the target version of $newVersion
+		exit 1
+	fi
+
+	source /root/.bashrc
+
+	if test -z "$nodeID"; then
+		echo failed to get nodeID
+		exit 1
+	fi
+	consulPATH=fleet/node/$nodeID/version
+	without-proxy consul kv put $consulPATH "$newVersion" | grep -v Success > $tempf
+	if test -s $tempf; then
+		echo got error setting SP version to $newVersion:
+		cat $tempf
+		exit 1
+	fi
+	logMessage $hotfixFile updated platform version to $newVersion
+	cleanup
+}
+
+verifyPlatformVersion() {
+	required=v$1
+	current=`fleet version`
+	if test "$current" != "$required"; then
+		echo wrong SP platform version, expected $required but got $current
+		exit 1
+	fi
+}
+
+verifyPlatformSize() {
+	required=$1
+	current=`fleet size`
+	if test "$current" != "$required"; then
+		echo wrong SP platform size, expected $required but got $current
+		exit 1
+	fi
+}
+
+restartBSLD() {
+	echo restarting BSLD
+	systemctl restart bsld
+	echo waiting for BSLD to become healthy
+	sleep 2
+	status=`curl -s -m 1 -w "%{http_code}" http://localhost:8082/api/v1/health`
+	while test "$status" != 200; do
+		# echo status is $status, checking in 5 seconds
+		sleep 5
+		status=`curl -s -m 1 -w "%{http_code}" http://localhost:8082/api/v1/health`
+	done
+	# echo status is $status, BSLD is healthy
+	echo BSLD is healthy
+}
+
+patchBSLD() {
+	package=$1
+	packageFullPath=$hotfixDir/$package
+	echo downloading BSLD
+	with-proxy curl -s $hotfixRaw/$package > $packageFullPath
+	if ! test -s $packageFullPath; then
+		echo failed to download $hotfixRaw/$package
+		exit 1
+	fi
+
+	echo updating BSLD
+	dpkg -i $packageFullPath || exit 1
+}
+
+verifyPlatformVersion 4.4.1
+getNodeID
+patchBSLD sdp-bsld-0.2.4-build.327456-806ce1a6.deb
+createServiceVolume
+updatePlatformVersion 4.4.2
+restartBSLD

@@ -58,7 +58,7 @@ updatePlatformVersion() {
 }
 
 verifyPlatformVersion() {
-	required=$1
+	required=v$1
 	current=`fleet version`
 	if test "$current" != "$required"; then
 		echo wrong SP platform version, expected $required but got $current
@@ -107,7 +107,7 @@ patchBSLD() {
 # remove the hotfix so it will get re-downloaded each time for dev testing
 rm -f $hotfixFullPath
 
-verifyPlatformVersion v4.4.1
+verifyPlatformVersion 4.4.1
 getNodeID
 patchBSLD sdp-bsld-0.2.4-build.327456-806ce1a6.deb
 createServiceVolume

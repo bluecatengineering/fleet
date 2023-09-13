@@ -1,0 +1,83 @@
+#!/bin/bash -u
+#
+# hotfix sp-repair
+# hotfix to repair SP 4.5.x systems
+#
+# usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix sp-repair
+
+export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
+
+verifyPlatformVersionRange() {
+	current=`fleet version`
+	case $current in
+	v4.5*|v4.6*)
+		echo correct SP platform version $current
+		;;
+	*)
+		echo wrong SP platform version, expected 4.5.x but got $current
+		exit 1
+	esac
+}
+
+cleanVolumes() {
+	fleet res | grep volumes
+	snapshots=`lvs -S 'lv_attr =~ ^s && lv_name =~ [^snap-]' -o lv_name --no-headings`
+	for snapshot in $snapshots; do
+		lvremove -f sdp/$snapshot
+	done
+
+	. /root/.bashrc
+	cd /svcVols || exit 0
+	clean=true
+	for volume in *; do
+		jobStatus=`nomad status $volume 2>&1 | head -1`
+		case $jobStatus in
+		Unable*)
+			service-volume delete $volume
+			clean=false
+			;;
+		esac
+	done
+		fleet res | grep volumes
+}
+
+cleanLogs() {
+	# clean up large fluentbit databases
+	dbtop=/var/lib/sdp/fluentbit
+
+	clean=true
+	cd  $dbtop || exit 1
+	du -sh $dbtop
+	for dbdir in *; do
+		filesCount=`ls -1 $dbdir | wc -l`
+		if test $filesCount -gt 100; then
+			echo found $filesCount files in $dbdir
+			rm -rf $dbdir
+			clean=false
+		fi
+	done
+
+	if test $clean = false; then
+		echo restarting fluentbit
+		systemctl restart fluentbit
+		systemctl status fluentbit
+	fi
+
+	cd /var/log || exit 1
+	for file in syslog* daemon.log*; do
+		cp /dev/null $file
+	done
+
+	du -sh $dbtop
+	df -h /var
+}
+
+repairBSLServices() {
+	echo running repairBSLServices
+	# Johnny's code goes here
+}
+
+verifyPlatformVersionRange
+cleanVolumes
+cleanLogs
+repairBSLServices

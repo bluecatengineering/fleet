@@ -62,7 +62,70 @@ cleanLogs() {
 
 repairBSLServices() {
 	echo running repairBSLServices
-	# Johnny's code goes here
+
+	 # BSLD Version Map
+    bsld_version_450="0.2.4-build.327491-e1163ff8"
+    bsld_version_451="0.2.4-build.341384-579b13f7"
+    bsld_version_460="0.2.4-build.371117-df002ae9"
+
+    # BSLC Version Map
+    bslc_version_450="0.2.4-build.323884-63ac0d26"
+    bslc_version_451="0.2.4-build.323884-63ac0d26"
+    bslc_version_460="0.2.4-build.371214-346712cc"
+
+    bslc_wait_interval="30"
+
+    installed_bsld_version=$(apt list --installed 2> /dev/null | grep sdp-bsld | cut -d ' ' -f2)
+    installed_bslc_version=$(docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]')
+    management_endpoint=$(jq ".managementHttpsEndpoint" --raw-output /opt/bluecat/bsld/conf/node.conf)
+
+    if [[ $current == "v4.5.0" ]]; then
+        bsld_target_version="$bsld_version_450"
+        bslc_target_version="$bslc_version_450"
+    elif [[ $current == "v4.5.1" ]]; then
+        bsld_target_version="$bsld_version_451"
+        bslc_target_version="$bslc_version_451"
+    else
+        echo "Service Point version is $current. Skipping version specific sanitzation..."
+        exit 0
+    fi
+
+    echo "BSLD version $installed_bsld_version found"
+    if [[ $installed_bsld_version != $bsld_target_version ]]; then
+        echo "Reinstalling BSLD to version $bsld_target_version"
+
+        apt update && apt install -y --allow-downgrades sdp-bsld=$bsld_target_version
+        systemctl restart bsld
+        systemctl restart telemetry-api
+    fi
+
+    echo "BSLC version $installed_bslc_version found"
+    if [[ $installed_bslc_version != $bslc_target_version ]]; then
+        echo "Reinstalling BSLC to version $bslc_target_version"
+
+        docker tag bslc:local bslc:backup
+        docker pull "$management_endpoint:443/library/bslc:$bslc_target_version"
+        docker tag "$management_endpoint:443/library/bslc:$bslc_target_version" bslc:local
+
+        echo "Restarting BSLC. Waiting for $bslc_wait_interval seconds..."
+        docker kill "$(docker ps | grep bslc | cut -d' ' -f 1)"
+        sleep $bslc_wait_interval
+
+        docker rmi bslc:backup
+        docker rmi "$management_endpoint:443/library/bslc:$bslc_target_version"
+    fi
+
+	# Verify installation
+	installed_bsld_version=$(apt list --installed 2> /dev/null | grep sdp-bsld | cut -d ' ' -f2)
+    installed_bslc_version=$(docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]')
+
+	if [[ $installed_bsld_version != $bsld_target_version || $installed_bslc_version != $bslc_target_version  ]]; then
+		echo "Expected SDP Packages are not installed on the system"
+		echo "SP Version: $current"
+		echo "BSLD Version: $installed_bsld_version"
+		echo "BSLC Version: $installed_bsld_version"
+		exit 1
+	fi
 }
 
 runHotfixSteps() {

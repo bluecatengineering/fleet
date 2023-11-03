@@ -45,7 +45,8 @@ cleanLogs() {
 
 	if test $clean = false; then
 		echo restarting fluentbit
-		systemctl restart fluentbit > /dev/null
+		systemctl restart fluentbit
+		systemctl --no-pager status fluentbit
 	fi
 
 	cd /var/log || exit 1

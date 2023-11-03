@@ -1,7 +1,7 @@
 #!/bin/bash -u
 #
 # hotfix sp-repair
-# hotfix to repair SP 4.5.x and 4.6.0 systems
+# hotfix to repair SP 4.5.x and 4.6.x systems
 #
 # usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix sp-repair
 
@@ -46,7 +46,7 @@ cleanLogs() {
 	if test $clean = false; then
 		echo restarting fluentbit
 		systemctl restart fluentbit
-		systemctl status fluentbit
+		systemctl --no-pager status fluentbit
 	fi
 
 	cd /var/log || exit 1
@@ -65,13 +65,15 @@ repairBSLServices() {
 	bsld_version_450="0.2.4-build.327491-e1163ff8"
 	bsld_version_451="0.2.4-build.341384-579b13f7"
 	bsld_version_460="0.2.4-build.371117-df002ae9"
+	bsld_version_461="0.2.4-build.385996-cd4b6df1"
 
 	# BSLC Version Map
 	bslc_version_450="0.2.4-build.323884-63ac0d26"
 	bslc_version_451="0.2.4-build.323884-63ac0d26"
 	bslc_version_460="0.2.4-build.371214-346712cc"
+	bslc_version_461="0.2.4-build.387679-d5328e36"
 
-	bslc_wait_interval="30"
+	bslc_wait_interval=30
 
 	installed_bsld_version=$(apt list --installed 2> /dev/null | grep sdp-bsld | cut -d ' ' -f2)
 	installed_bslc_version=$(docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]')
@@ -86,35 +88,45 @@ repairBSLServices() {
     elif [[ $current == "v4.6.0" ]]; then
         bsld_target_version="$bsld_version_460"
         bslc_target_version="$bslc_version_460"
+	elif [[ $current == "v4.6.1" ]]; then
+		bsld_target_version="$bsld_version_461"
+		bslc_target_version="$bslc_version_461"
 	else
 		echo "Service Point version is $current. Skipping version specific repairs..."
 		exit 0
 	fi
 
+	# Reinstall BSLD
 	echo "BSLD version $installed_bsld_version found"
-	if [[ $installed_bsld_version != $bsld_target_version ]]; then
-		echo "Reinstalling BSLD to version $bsld_target_version"
+	sha256sum /opt/bluecat/bsld/bin/bsld
 
-		apt update && apt install -y --allow-downgrades sdp-bsld=$bsld_target_version
-		systemctl restart bsld
-		systemctl restart telemetry-api
-	fi
+	echo "Reinstalling BSLD to version $bsld_target_version"
+	apt update && apt install -y --allow-downgrades --reinstall sdp-bsld=$bsld_target_version
 
+	echo "Reinstalled BSLD sha256sum"
+	sha256sum /opt/bluecat/bsld/bin/bsld
+
+	systemctl restart bsld
+	systemctl restart telemetry-api
+
+	# Reinstall BSLC
 	echo "BSLC version $installed_bslc_version found"
-	if [[ $installed_bslc_version != $bslc_target_version ]]; then
-		echo "Reinstalling BSLC to version $bslc_target_version"
+	docker inspect --format='{{.ID}}' bslc:local
 
-		docker tag bslc:local bslc:backup
-		docker pull "$management_endpoint:443/library/bslc:$bslc_target_version"
-		docker tag "$management_endpoint:443/library/bslc:$bslc_target_version" bslc:local
+	echo "Reinstalling BSLC to version $bslc_target_version"
+	docker tag bslc:local bslc:backup
+	docker pull "$management_endpoint:443/library/bslc:$bslc_target_version"
+	docker tag "$management_endpoint:443/library/bslc:$bslc_target_version" bslc:local
 
-		echo "Restarting BSLC. Waiting for $bslc_wait_interval seconds..."
-		docker kill "$(docker ps | grep bslc | cut -d' ' -f 1)"
-		sleep $bslc_wait_interval
+	echo "Reinstalled BSLC Docker Image sha256"
+	docker inspect --format='{{.ID}}' bslc:local
 
-		docker rmi bslc:backup
-		docker rmi "$management_endpoint:443/library/bslc:$bslc_target_version"
-	fi
+	echo "Restarting BSLC. Waiting for $bslc_wait_interval seconds..."
+	docker kill "$(docker ps | grep bslc | cut -d' ' -f 1)"
+	sleep $bslc_wait_interval
+
+	docker rmi bslc:backup
+	docker rmi "$management_endpoint:443/library/bslc:$bslc_target_version"
 
 	# Verify installation
 	installed_bsld_version=$(apt list --installed 2> /dev/null | grep sdp-bsld | cut -d ' ' -f2)
@@ -132,14 +144,14 @@ repairBSLServices() {
 runHotfixSteps() {
 	current=`fleet version`
 	case $current in
-	v4.5*|v4.6.0)
+	v4.5.*|v4.6.*)
 		echo correct SP platform version $current
 		cleanVolumes
 		cleanLogs
 		repairBSLServices
 		;;
 	*)
-		echo wrong SP platform version, expected 4.5.x or 4.6.0 but got $current
+		echo wrong SP platform version, expected 4.5.x or 4.6.x but got $current
 		exit 1
 	esac
 }

@@ -147,7 +147,7 @@ repairNomadParentContainer() {
 	npc_image_backup="nomad-parent-container:backup"
 
 	if [[ $(docker images --format "{{.ID}}" $npc_image_local | wc -l) -gt 0 ]]; then
-		echo "$npc_image_local already installed. Skipping to repair $npc_image_local..."
+		echo "$npc_image_local already installed. Skipping repair of $npc_image_local..."
 		return
 	fi
 
@@ -173,9 +173,11 @@ installBSLD() {
 
 	# verify install
 	installed=$(apt list --installed sdp-bsld 2>/dev/null -qq | sed 's/\(.*\)\/[^ ]* \([^ ]*\) .*/\1=\2/')
+	echo "BSLD version $installed installed"
+	sha256sum /opt/bluecat/bsld/bin/bsld
 	if [[ $installed != $package ]]; then
 		echo "Expected BSLD package is not installed on the system"
-		echo "BSLD Version: $installed"
+		echo "Expected BSLD Version: $package"
 		exit 1
 	fi
 }

@@ -141,14 +141,73 @@ repairBSLServices() {
 	fi
 }
 
+repairNomadParentContainer() {
+	echo running repairNomadParentContainer
+	npc_image_local="nomad-parent-container:local"
+	npc_image_backup="nomad-parent-container:backup"
+
+	if [[ $(docker images --format "{{.ID}}" $npc_image_local | wc -l) -gt 0 ]]; then
+		echo "$npc_image_local already installed. Skipping to repair $npc_image_local..."
+		return
+	fi
+
+	docker_registry="$(jq -r '.managementHttpsEndpoint' /opt/bluecat/bsld/conf/node.conf):443/library"
+	npc_image_461="$docker_registry/nomad-parent-container:1.4.12-build.381104-d8a94958"
+
+	docker pull "$npc_image_461"
+	if [[ $(docker images --format "{{.ID}}" $npc_image_461 | wc -l) -eq 0 ]]; then
+		echo "Unable to download docker image $npc_image_461. Exiting..."
+		exit 1
+	fi
+
+	docker tag "$npc_image_461" "$npc_image_local"
+	docker tag "$npc_image_461" "$npc_image_backup"
+	docker rmi $npc_image_461
+}
+
+installBSLD() {
+	echo installing BSLD
+	package="sdp-bsld=$1"
+
+	apt update && apt install --reinstall -y $package
+
+	# verify install
+	installed=$(apt list --installed sdp-bsld 2>/dev/null -qq | sed 's/\(.*\)\/[^ ]* \([^ ]*\) .*/\1=\2/')
+	if [[ $installed != $package ]]; then
+		echo "Expected BSLD package is not installed on the system"
+		echo "BSLD Version: $installed"
+		exit 1
+	fi
+}
+
+restartBSLD() {
+	echo restarting BSLD
+	systemctl restart bsld
+	echo waiting for BSLD to become healthy
+	sleep 2
+	status=`curl -s -m 1 -w "%{http_code}" http://localhost:8082/api/v1/health`
+	while test "$status" != 200; do
+		sleep 5
+		status=`curl -s -m 1 -w "%{http_code}" http://localhost:8082/api/v1/health`
+	done
+	echo BSLD is healthy
+}
+
+
 runHotfixSteps() {
 	current=`fleet version`
 	case $current in
-	v4.5.*|v4.6.*)
+	v4.5.*|v4.6.0)
 		echo correct SP platform version $current
 		cleanVolumes
 		cleanLogs
 		repairBSLServices
+		;;
+	v4.6.1)
+		echo correct SP platform version $current
+		installBSLD "0.2.4-build.408703-d88ca3b1"
+		restartBSLD
+		repairNomadParentContainer
 		;;
 	*)
 		echo wrong SP platform version, expected 4.5.x or 4.6.x but got $current

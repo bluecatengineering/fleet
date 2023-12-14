@@ -1,0 +1,180 @@
+#!/bin/bash -u
+#
+# hotfix sp-checkup
+# hotfix to check for possible issues on any SP (merge of reachability and warnings scripts)
+#
+# usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix sp-checkup
+
+#!/bin/bash
+# reachability - verifies a service point can reach all required cloud endpoints
+
+usage() {
+    echo 'usage: reachability [-e env]'
+    exit 0
+}
+
+TIMEFORMAT=%R;
+TMP=/tmp/reachability.$USER.$$
+fleetEnv=`fleet env`
+
+shift
+
+case $# in
+2)
+    if test $1 = '-e'; then
+        fleetEnv=$2
+    else
+        usage
+    fi
+    ;;
+0)
+    ;;
+*)
+    usage
+    ;;
+esac
+
+pingUrl=https://service-layer.$fleetEnv.fleet.bluec.at/ping
+elapsed=`time (with-proxy curl -s --max-time 5 \
+    --key /opt/bluecat/apt/etc/certs/managementKey.pem \
+    --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
+    --cacert /usr/local/share/ca-certificates/sdp-dev-server-ca.crt $pingUrl > $TMP) 2>&1`
+
+
+response=`cat $TMP`
+expectedResponse="OK"
+if ! test "$response" = "$expectedResponse"; then
+    echo error: bad response from Fleet $pingUrl - expected $expectedResponse but got $response in $elapsed seconds
+else
+    echo good response from Fleet $pingUrl in $elapsed seconds
+fi
+
+notaryEnv=$fleetEnv
+case $fleetEnv in
+us)
+    notaryEnv=prod
+    ;;
+dev*|integration)
+    notaryEnv=alpha
+    ;;
+esac
+
+vertexUrl=https://vertex.$notaryEnv.edge.bluec.at/v1/jwks
+
+case $notaryEnv in
+alpha)
+    vertexUrl=https://vertex.$notaryEnv.bluecat.io/v1/jwks
+    ;;
+esac
+
+elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" $vertexUrl > $TMP) 2>&1`
+
+response=`cat $TMP`
+expectedResponse="200"
+case $response in
+*200)
+    echo good response from Notary $vertexUrl in $elapsed seconds
+    ;;
+*)
+    echo error: bad response from Notary $vertexUrl - expected $expectedResponse but got $response in $elapsed seconds
+    ;;
+esac
+
+URL=https://service-layer.$fleetEnv.fleet.bluec.at/packages/pool/main/d/docker-ce
+PKG=docker-ce-cli_5%3a24.0.7-1~debian.11~bullseye_amd64.deb
+URL_ENCODED=$URL/$(echo $PKG | tr -d '\n' | jq -sRr @uri)
+
+elapsed=`time (with-proxy curl -s --max-time 5 \
+    --key /opt/bluecat/apt/etc/certs/managementKey.pem \
+    --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
+    --cacert /usr/local/share/ca-certificates/sdp-dev-server-ca.crt $URL_ENCODED > $TMP) 2>&1`
+
+fileSize=`du -sk $TMP | awk '{print $1}'`
+
+if test $fileSize -lt 1000; then
+    echo failed to download speed test file from $URL_ENCODED
+    rm -f $TMP
+    exit 1
+fi
+
+speedKB=$( awk "BEGIN { print int($fileSize/$elapsed)}" )
+speedMB=$( awk "BEGIN { print $speedKB/1024 }" )
+speedMBint=$( awk "BEGIN { print int($speedMB)}" )
+
+# echo elapsed: $elapsed seconds
+# echo fileSize: $fileSize KB
+# echo speed: $speedKB KB / sec
+
+if test $speedMBint -lt 20; then
+    echo warning: download speed of $speedMBint MB/second is too low and might result in unreliable behaviour
+else
+    echo good download speed of $speedMBint MB/second
+fi
+
+rm -f $TMP
+
+#!/bin/bash -u
+# sh options:
+# -e  Exit immediately if a command exits with a non-zero status
+# -u  Treat unset variables as an error when substituting
+#
+# warnings - warn about potential problems on an Edge Service Point
+
+export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
+TMP=/tmp/warnings.$USER.$$
+
+checkPartition() {
+    for partition in $*; do
+        if ! test -d $partition; then
+            continue
+        fi
+        percentFull=`df $partition | grep $partition | awk '{print $5}' | sed s/\%//`
+        if test $percentFull -gt 80; then
+            echo "warning: Disk partition $partition is $percentFull% full"
+        fi
+    done
+}
+
+checkCerts() {
+    localCerts=/usr/local/share/ca-certificates
+    ls -l $localCerts | grep -v '^total' > $TMP
+    lines=`wc -l $TMP | awk '{print $1}'`
+    if test $lines -ne 1; then
+        echo "warning: Non-standard certificates installed in $localCerts"
+        cat $TMP
+    fi
+}
+
+checkNetworkInterfaces() {
+    interfaces=`ifconfig -a | grep flags | egrep -v 'dsr|veth|sdp|nomad|eth0|^lo|docker0'`
+    for interface in $interfaces; do
+        ifconfig $interface > $TMP 2>&1
+        lines=`wc -l $TMP | awk '{print $1}'`
+        if test $lines -ne 1; then
+            echo "warning: Non-standard network interface found: $interface"
+            cat $TMP
+        fi
+    done
+}
+
+checkNameservers() {
+    mgmtEndpoint=`grep managementHttpsEndpoint /opt/bluecat/bsld/conf/node.conf  | awk '{print $2}' | sed s/\"//g | sed s/,//`
+
+    if ! test x"$mgmtEndpoint" = x; then
+        for nameServer in `grep nameserver /etc/resolv.conf | grep -v '#' | awk '{print $2}'`; do
+            answer=`dig +short +tries=2 +timeout=3 @$nameServer $mgmtEndpoint`
+            case "$answer" in
+            *"connection timed out"*)
+                echo "warning: Fleet /etc/resolv.conf configured with broken nameserver: $nameServer"
+                ;;
+            esac
+        done
+    fi
+}
+
+checkNameservers
+checkPartition / /var /svcVols/*
+checkCerts
+checkNetworkInterfaces
+rm -f $TMP
+problems -h

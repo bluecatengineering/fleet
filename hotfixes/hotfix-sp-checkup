@@ -59,26 +59,48 @@ dev*|integration)
     ;;
 esac
 
-vertexUrl=https://vertex.$notaryEnv.edge.bluec.at/v1/jwks
+vertexUrl=https://vertex.$notaryEnv.edge.bluec.at
+mtlsVertexUrl=https://vertex-m.$notaryEnv.edge.bluec.at
 
 case $notaryEnv in
 alpha)
-    vertexUrl=https://vertex.$notaryEnv.bluecat.io/v1/jwks
+    vertexUrl=https://vertex.$notaryEnv.bluecat.io
+    mtlsVertexUrl=https://vertex-m.$notaryEnv.bluecat.io
     ;;
 esac
 
-elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" $vertexUrl > $TMP) 2>&1`
+testUrl=$vertexUrl/v1/jwks
+elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" $testUrl > $TMP) 2>&1`
 
 response=`cat $TMP`
 expectedResponse="200"
 case $response in
 *200)
-    echo good response from Notary $vertexUrl in $elapsed seconds
+    echo good response from Notary $testUrl in $elapsed seconds
     ;;
 *)
-    echo error: bad response from Notary $vertexUrl - expected $expectedResponse but got $response in $elapsed seconds
+    echo error: bad response from Notary $testUrl - expected $expectedResponse but got $response in $elapsed seconds
     ;;
 esac
+
+rm -rf xx00 xx01
+csplit --silent /home/egw/bundle.pem '/-----BEGIN CERTIFICATE-----/'
+
+testUrl=$mtlsVertexUrl/v1/jwt
+elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert xx01 --key xx00 $testUrl > $TMP) 2>&1`
+
+response=`cat $TMP`
+expectedResponse="200"
+case $response in
+*200)
+    echo good response from Notary $testUrl in $elapsed seconds
+    ;;
+*)
+    echo error: bad response from Notary $testUrl - expected $expectedResponse but got $response in $elapsed seconds
+    ;;
+esac
+
+rm -rf xx00 xx01
 
 URL=https://service-layer.$fleetEnv.fleet.bluec.at/packages/pool/main/d/docker-ce
 PKG=docker-ce-cli_5%3a24.0.7-1~debian.11~bullseye_amd64.deb
@@ -93,8 +115,8 @@ fileSize=`du -sk $TMP | awk '{print $1}'`
 
 if test $fileSize -lt 1000; then
     echo failed to download speed test file from $URL_ENCODED
+    head -5 $TMP
     rm -f $TMP
-    exit 1
 fi
 
 speedKB=$( awk "BEGIN { print int($fileSize/$elapsed)}" )

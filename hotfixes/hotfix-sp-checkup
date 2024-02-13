@@ -9,107 +9,196 @@
 # reachability - verifies a service point can reach all required cloud endpoints
 
 usage() {
-    echo 'usage: reachability [-e env]'
+    echo 'usage: reachability [-e <fleet env>] [-c <customer subdomain>] [-d]'
+    echo '   -e <env>:                Fleet environment name (optional); specify to override the value provided by the "fleet env" command'
+    echo '   -c <customer subdomain>: customer subdomain'
+    echo '   -d:                      save DEBUG output to file in case of failure'
     exit 0
 }
 
 TIMEFORMAT=%R;
 TMP=/tmp/reachability.$USER.$$
+
+#################
+# Parse arguments
+#################
+
 fleetEnv=`fleet env`
+debug=0
+customerSubdomain=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -e)
+            fleetEnv="$2"
+            shift
+            shift
+            ;;
+        -c)
+            customerSubdomain="$2"
+            shift
+            shift
+            ;;
+        -d)
+            debug=1
+            shift
+            ;;
+        *)
+            usage
+            ;;
+    esac
+done
 
-shift
+##########################################################
+# Edge root domain (used for Customer Instance and Vertex)
+##########################################################
 
-case $# in
-2)
-    if test $1 = '-e'; then
-        fleetEnv=$2
-    else
-        usage
-    fi
-    ;;
-0)
-    ;;
-*)
-    usage
-    ;;
+case $fleetEnv in
+    dev|development|integration|eu-integration|alpha)
+        rootDomain=bluecat.io
+        ;;
+    pilot|us|eu)
+        rootDomain=edge.bluec.at
+        ;;
 esac
 
-pingUrl=https://service-layer.$fleetEnv.fleet.bluec.at/ping
-elapsed=`time (with-proxy curl -s --max-time 5 \
-    --key /opt/bluecat/apt/etc/certs/managementKey.pem \
-    --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
-    --cacert /usr/local/share/ca-certificates/sdp-dev-server-ca.crt $pingUrl > $TMP) 2>&1`
+##########################################
+# Check Service Layer (Fleet) reachability
+##########################################
 
+fleetUrl=https://service-layer.$fleetEnv.fleet.bluec.at/ping
+fleetKey=/opt/bluecat/apt/etc/certs/managementKey.pem
+fleetCert=/opt/bluecat/apt/etc/certs/managementCert.pem
+fleetCacert=/usr/local/share/ca-certificates/sdp-dev-server-ca.crt
+elapsed=$(time (with-proxy curl -s --max-time 5 --key "$fleetKey" --cert "$fleetCert" --cacert "$fleetCacert" "$fleetUrl" > "$TMP") 2>&1)
 
-response=`cat $TMP`
+response=$(cat "$TMP")
 expectedResponse="OK"
-if ! test "$response" = "$expectedResponse"; then
-    echo error: bad response from Fleet $pingUrl - expected $expectedResponse but got $response in $elapsed seconds
+if test "$response" = "$expectedResponse"; then
+    echo "got OK from $fleetUrl in $elapsed seconds"
 else
-    echo good response from Fleet $pingUrl in $elapsed seconds
+    echo "error: expected OK but got $response from $fleetUrl in $elapsed seconds"
+    if [ $debug == 1 ]; then
+        fleetLog=/tmp/fleet.log
+        with-proxy curl -v --max-time 5 --key "$fleetKey" --cert "$fleetCert" --cacert "$fleetCacert" "$fleetUrl" &> $fleetLog
+        echo "See $fleetLog for DEBUG output"
+    fi
 fi
 
-notaryEnv=$fleetEnv
+#################################################
+# Vertex environment
+#################################################
+
 case $fleetEnv in
-us)
-    notaryEnv=prod
-    ;;
-dev*|integration)
-    notaryEnv=alpha
-    ;;
+    dev|development|integration|eu-integration|alpha)
+        vertexEnv=alpha
+        ;;
+    pilot)
+        vertexEnv=pilot
+        ;;
+    us)
+        vertexEnv=prod
+        ;;
+    eu)
+        vertexEnv=eu
+        ;;
 esac
 
-vertexUrl=https://vertex.$notaryEnv.edge.bluec.at
-mtlsVertexUrl=https://vertex-m.$notaryEnv.edge.bluec.at
+#################################################
+# Check Notary reachability in Vertex environment
+#################################################
 
-case $notaryEnv in
-alpha)
-    vertexUrl=https://vertex.$notaryEnv.bluecat.io
-    mtlsVertexUrl=https://vertex-m.$notaryEnv.bluecat.io
-    ;;
-esac
-
-testUrl=$vertexUrl/v1/jwks
-elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" $testUrl > $TMP) 2>&1`
-
-response=`cat $TMP`
-expectedResponse="200"
+vertexUrl="https://vertex.$vertexEnv.$rootDomain/v1/jwks"
+elapsed=$(time (with-proxy curl -s --max-time 5 -w "%{http_code}" "$vertexUrl" > "$TMP") 2>&1)
+response=$(cat "$TMP")
 case $response in
-*200)
-    echo good response from Notary $testUrl in $elapsed seconds
-    ;;
-*)
-    echo error: bad response from Notary $testUrl - expected $expectedResponse but got $response in $elapsed seconds
-    ;;
+    *200)
+        echo "got 200 from $vertexUrl in $elapsed seconds"
+        ;;
+    *)
+        echo "error: expected 200 but got $response from $vertexUrl in $elapsed seconds"
+        if [ $debug == 1 ]; then
+            vertexLog=/tmp/vertex.log
+            with-proxy curl -v --max-time 5 $vertexUrl &> $vertexLog
+            echo "See $vertexLog for DEBUG output"
+        fi
+        ;;
 esac
 
-rm -rf xx00 xx01
-csplit --silent /home/egw/bundle.pem '/-----BEGIN CERTIFICATE-----/'
+###################################
+# Get Notary ID certificate and key
+###################################
 
-testUrl=$mtlsVertexUrl/v1/jwt
-elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert xx01 --key xx00 $testUrl > $TMP) 2>&1`
+notaryCert=xx00
+notaryKey=xx01
+rm -rf $notaryCert $notaryKey
 
-response=`cat $TMP`
-expectedResponse="200"
-case $response in
-*200)
-    echo good response from Notary $testUrl in $elapsed seconds
-    ;;
-*)
-    echo error: bad response from Notary $testUrl - expected $expectedResponse but got $response in $elapsed seconds
-    ;;
-esac
+notaryBundle=/home/egw/bundle.pem
+[ -f $notaryBundle ] && csplit --silent $notaryBundle '/-----BEGIN CERTIFICATE-----/'
 
-rm -rf xx00 xx01
+######################################################
+# Check Notary MTLS reachability in Vertex environment
+######################################################
+
+mtlsVertexUrl=https://vertex-m.$vertexEnv.$rootDomain/v1/jwt
+if [ ! -f $notaryBundle ]; then
+    echo "error: cannot reach $mtlsVertexUrl without $notaryBundle"
+else
+    elapsed=$(time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert "$notaryKey" --key "$notaryCert" "$mtlsVertexUrl" > "$TMP") 2>&1)
+    response=$(cat "$TMP")
+    case $response in
+        *200)
+            echo "got 200 from $mtlsVertexUrl in $elapsed seconds"
+            ;;
+        *)
+            echo "error: expected 200 but got $response from $mtlsVertexUrl in $elapsed seconds"
+            if [ $debug == 1 ]; then
+                mtlsVertexLog=/tmp/mtls_vertex.log
+                with-proxy curl -v --max-time 5 --cert "$notaryKey" --key "$notaryCert" $mtlsVertexUrl &> $mtlsVertexLog
+                echo "See $mtlsVertexLog for DEBUG output"
+            fi
+            ;;
+    esac
+fi
+
+######################################
+# Check Customer Instance reachability
+######################################
+
+if [ -n "$customerSubdomain" ]; then
+    mtlsCustomerDomain=api.$customerSubdomain-m.$rootDomain
+    mtlsCustomerUrl=https://$mtlsCustomerDomain/ims/v1/identities
+    if [ ! -f $notaryBundle ]; then
+        echo "error: cannot reach $mtlsCustomerUrl without $notaryBundle"
+    else
+        elapsed=$(time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert "$notaryKey" --key "$notaryCert" "$mtlsCustomerUrl" > "$TMP") 2>&1)
+        response=$(cat "$TMP")
+        case $response in
+            *200)
+                echo "got 200 from $mtlsCustomerUrl in $elapsed seconds"
+                ;;
+            *)
+                echo "error: expected 200 but got $response from $mtlsCustomerUrl in $elapsed seconds"
+                if [ $debug == 1 ]; then
+                    mtlsCustomerLog=/tmp/mtls_customer.log
+                    with-proxy curl -v --max-time 5 --cert "$notaryKey" --key "$notaryCert" "$mtlsCustomerUrl" &> $mtlsCustomerLog
+                    echo "See $mtlsCustomerLog for DEBUG output"
+                fi
+                ;;
+        esac
+    fi
+fi
+
+rm -rf "$notaryCert" "$notaryKey"
+
+##############################
+# Check Fleet package download
+##############################
 
 URL=https://service-layer.$fleetEnv.fleet.bluec.at/packages/pool/main/d/docker-ce
 PKG=docker-ce-cli_5%3a24.0.7-1~debian.11~bullseye_amd64.deb
 URL_ENCODED=$URL/$(echo $PKG | tr -d '\n' | jq -sRr @uri)
 
-elapsed=`time (with-proxy curl -s --max-time 5 \
-    --key /opt/bluecat/apt/etc/certs/managementKey.pem \
-    --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
-    --cacert /usr/local/share/ca-certificates/sdp-dev-server-ca.crt $URL_ENCODED > $TMP) 2>&1`
+elapsed=$(time (with-proxy curl -s --max-time 5 --key "$fleetKey" --cert "$fleetCert" --cacert "$fleetCacert" "$URL_ENCODED" > "$TMP") 2>&1)
 
 fileSize=`du -sk $TMP | awk '{print $1}'`
 

@@ -1,0 +1,322 @@
+#!/bin/bash -u
+#
+# hotfix sp-checkup
+# hotfix to check for possible issues on any SP (merge of reachability and warnings scripts)
+#
+# usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix sp-checkup
+
+shift
+customerSubdomain=""
+
+#!/bin/bash
+# reachability - verifies a service point can reach all required cloud endpoints
+#
+# Changes
+# 4.6.2: reachability script was introduced
+# 4.7.0: added "-v" flag for verbose mode and "-c customer-subdomain" flag for testing CI connectivity
+
+usage() {
+    echo 'usage: reachability [-v] [--healthcheck] [-e env] [-c customer-subdomain]'
+    exit 0
+}
+
+export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
+TIMEFORMAT=%R;
+TMP=/tmp/reachability.$USER.$$
+cacert=/usr/local/share/ca-certificates/sdp-dev-server-ca.crt
+
+sudoCmd=sudo
+if test `whoami` = root; then
+	sudoCmd=""
+fi
+
+verbose=false
+healthcheck=false
+
+echoIfNotHealthcheck() {
+    if test $healthcheck = false; then
+        echo $*
+    fi
+}
+
+fleetEnv=`fleet env`
+
+while test $# -gt 0; do
+	case $1 in
+	--help)
+		usage
+		;;
+	-v)
+		verbose=true
+		;;
+	--healthcheck|-h)
+		healthcheck=true
+		;;
+	-e)
+		fleetEnv=$2
+		shift
+		;;
+	-c)
+		customerSubdomain=$2
+		shift
+		;;
+	*)
+		echo 'flag not recognized: ' $1
+		usage
+	esac
+	shift
+done
+
+vertexEnv=$fleetEnv
+rootDomain=bluecat.io
+ciDomain=bluec.at
+
+case $fleetEnv in
+us)
+    vertexEnv=prod
+    rootDomain=edge.bluec.at
+    ciDomain=$rootDomain
+    ;;
+eu)
+    vertexEnv=eu
+    rootDomain=edge.bluec.at
+    ciDomain=$rootDomain
+    cacert=/usr/local/share/ca-certificates/sdp-dev-server-ca2.crt
+    ;;
+pilot)
+    vertexEnv=pilot
+    rootDomain=edge.bluec.at
+    ciDomain=pilot.bluec.at
+    ;;
+eu-integration)
+    vertexEnv=alpha
+    cacert=/usr/local/share/ca-certificates/sdp-dev-server-ca2.crt
+    ;;
+dev*|integration|alpha)
+    vertexEnv=alpha
+    ;;
+esac
+
+pingUrl=https://service-layer.$fleetEnv.fleet.bluec.at/ping
+elapsed=`time (with-proxy curl -s --max-time 5 \
+    --key /opt/bluecat/apt/etc/certs/managementKey.pem \
+    --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
+    --cacert $cacert $pingUrl > $TMP) 2>&1`
+
+response=`cat $TMP`
+expectedResponse="OK"
+if ! test "$response" = "$expectedResponse"; then
+    echo warning: bad response from Fleet $pingUrl - expected $expectedResponse but got $response in $elapsed seconds
+    if test $verbose == true; then
+        with-proxy curl -v --max-time 5 \
+        --key /opt/bluecat/apt/etc/certs/managementKey.pem \
+        --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
+        --cacert $cacert $pingUrl
+    fi
+else
+    echoIfNotHealthcheck good response from Fleet $pingUrl in $elapsed seconds
+fi
+
+vertexUrl=https://vertex.$vertexEnv.$rootDomain
+mtlsVertexUrl=https://vertex-m.$vertexEnv.$rootDomain
+
+testUrl=$vertexUrl/v1/jwks
+elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" $testUrl > $TMP) 2>&1`
+
+response=`cat $TMP`
+expectedResponse="200"
+case $response in
+*200)
+    echoIfNotHealthcheck good response from Notary-TLS $testUrl in $elapsed seconds
+    ;;
+*)
+    echo warning: bad response from Notary-TLS $testUrl - expected $expectedResponse but got $response in $elapsed seconds
+    if test $verbose == true; then
+        with-proxy curl -v --max-time 5 $testUrl
+    fi
+    ;;
+esac
+
+notaryBundle=/home/egw/bundle.pem
+
+if ! test -f $notaryBundle; then
+    echo error: cannot test mTLS endpoints without $notaryBundle
+    exit 1
+fi
+
+notaryCert=xx00
+notaryKey=xx01
+$sudoCmd rm -rf $notaryCert $notaryKey
+$sudoCmd csplit --silent $notaryBundle '/-----BEGIN CERTIFICATE-----/'
+
+testUrl=$mtlsVertexUrl/v1/jwt
+elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert $notaryKey --key $notaryCert $testUrl > $TMP) 2>&1`
+
+response=`cat $TMP`
+expectedResponse="200"
+case $response in
+*200)
+    echoIfNotHealthcheck good response from Notary-mTLS $testUrl in $elapsed seconds
+    ;;
+*)
+    echo warning: bad response from Notary-mTLS $testUrl - expected $expectedResponse but got $response in $elapsed seconds
+    if test $verbose == true; then
+        with-proxy curl -v --max-time 5 --cert $notaryKey --key $notaryCert $testUrl
+    fi
+    ;;
+esac
+
+if test -n "$customerSubdomain"; then
+    mtlsCustomerDomain=api.$customerSubdomain-m.$ciDomain
+    mtlsCustomerUrl=https://$mtlsCustomerDomain/ims/v1/identities
+    
+    elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert $notaryKey --key $notaryCert $mtlsCustomerUrl > $TMP) 2>&1`
+    response=`cat $TMP`
+    case $response in
+        *200)
+            echoIfNotHealthcheck "good response from CI-mTLS $mtlsCustomerUrl in $elapsed seconds"
+            ;;
+        *)
+            echo "warning: bad response from CI-mTLS $mtlsCustomerUrl - got $response in $elapsed seconds"
+            if test $verbose == true; then
+                with-proxy curl -v --max-time 5 --cert $notaryKey --key $notaryCert $mtlsCustomerUrl
+            fi
+            ;;
+    esac
+fi
+
+$sudoCmd rm -rf $notaryCert $notaryKey
+
+URL=https://service-layer.$fleetEnv.fleet.bluec.at/packages/pool/main/d/docker-ce
+PKG=docker-ce-cli_5%3a24.0.7-1~debian.11~bullseye_amd64.deb
+URL_ENCODED=$URL/$(echo $PKG | tr -d '\n' | jq -sRr @uri)
+
+elapsed=`time (with-proxy curl -s --max-time 5 \
+    --key /opt/bluecat/apt/etc/certs/managementKey.pem \
+    --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
+    --cacert $cacert $URL_ENCODED > $TMP) 2>&1`
+
+fileSize=`du -sk $TMP | awk '{print $1}'`
+
+if test $fileSize -lt 1000; then
+    echo warning: failed to download speed test file from $URL_ENCODED
+    if test $healthcheck = false; then
+        head -5 $TMP
+    fi
+    rm -f $TMP
+fi
+
+speedKB=$( awk "BEGIN { print int($fileSize/$elapsed)}" )
+speedMB=$( awk "BEGIN { print $speedKB/1024 }" )
+speedMBint=$( awk "BEGIN { print int($speedMB)}" )
+
+# echo elapsed: $elapsed seconds
+# echo fileSize: $fileSize KB
+# echo speed: $speedKB KB / sec
+
+if test $speedMBint = 0; then
+    echo warning: failed to download speed test file from $URL_ENCODED
+elif test $speedMBint -lt 10; then
+    echo warning: download speed of $speedMBint MB/second is too low and might result in unreliable behaviour
+elif test $speedMBint -lt 20; then
+    echoIfNotHealthcheck acceptable download speed of $speedMBint MB/second
+else
+    echoIfNotHealthcheck good download speed of $speedMBint MB/second
+fi
+
+rm -f $TMP
+#!/bin/bash -u
+# sh options:
+# -e  Exit immediately if a command exits with a non-zero status
+# -u  Treat unset variables as an error when substituting
+#
+# warnings - warn about potential problems on an Edge Service Point
+
+export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
+TMP=/tmp/warnings.$USER.$$
+
+healthcheck=false
+
+echoIfNotHealthcheck() {
+    if test $healthcheck = false; then
+        echo $*
+    fi
+}
+
+if test $# -gt 0; then
+	if test $1 = "--healthcheck" || test $1 = "-h" ; then
+		healthcheck=true
+        shift
+	fi
+fi
+
+checkPartition() {
+    for partition in $*; do
+        if ! test -d $partition; then
+            continue
+        fi
+        percentFull=`df $partition | grep $partition | awk '{print $5}' | sed s/\%//`
+        if test $percentFull -gt 80; then
+            echo "warning: Disk partition $partition is $percentFull% full"
+        fi
+    done
+}
+
+checkCerts() {
+    localCerts=/usr/local/share/ca-certificates
+    ls -l $localCerts | egrep -v '^total|sdp-dev-server' > $TMP
+    lines=`wc -l $TMP | awk '{print $1}'`
+    if test $lines -ne 0; then
+        echo "warning: Non-standard certificates installed in $localCerts"
+        if test $healthcheck = false; then
+            cat $TMP
+        fi
+    fi
+}
+
+checkNetworkInterfaces() {
+    interfaces=`ifconfig -a | grep flags | egrep -v 'dsr|veth|sdp|nomad|eth0|^lo|docker0'`
+    for interface in $interfaces; do
+        ifconfig $interface > $TMP 2>&1
+        lines=`wc -l $TMP | awk '{print $1}'`
+        if test $lines -ne 1; then
+            echo "warning: Non-standard network interface found: $interface"
+            if test $healthcheck = false; then
+                cat $TMP
+            fi
+        fi
+    done
+}
+
+checkNameservers() {
+    mgmtEndpoint=`grep managementHttpsEndpoint /opt/bluecat/bsld/conf/node.conf  | awk '{print $2}' | sed s/\"//g | sed s/,//`
+
+    if ! test x"$mgmtEndpoint" = x; then
+        for nameServer in `grep nameserver /etc/resolv.conf | grep -v '#' | awk '{print $2}'`; do
+            answer=`dig +short +tries=2 +timeout=3 @$nameServer $mgmtEndpoint`
+            case "$answer" in
+            *"connection timed out"*)
+                echo "warning: Fleet /etc/resolv.conf configured with broken nameserver: $nameServer"
+                ;;
+            esac
+        done
+    fi
+}
+
+checkNameservers
+checkPartition / /var /svcVols/*
+checkCerts
+
+case `fleet platform` in
+bdds*)
+	;;
+*)
+	checkNetworkInterfaces
+	;;
+esac
+
+rm -f $TMP
+
+if test $healthcheck = true; then
+    reachability --healthcheck
+fi

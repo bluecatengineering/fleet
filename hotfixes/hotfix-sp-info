@@ -1,0 +1,12 @@
+#!/bin/bash -u
+#
+# hotfix sp-info
+# hotfix to get additional information about an SP
+#
+# usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix sp-info
+
+echo BSLD version: `apt list --installed 2> /dev/null | grep sdp-bsld | cut -d ' ' -f2`
+echo BSLD checksum: `sha256sum /opt/bluecat/bsld/bin/bsld`
+echo BSLC version: `docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]'`
+echo BSLC checksum: `docker inspect --format='{{.ID}}' bslc:local`
+

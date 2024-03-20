@@ -207,7 +207,7 @@ runHotfixSteps() {
 		;;
 	v4.6.1)
 		echo correct SP platform version $current
-		installBSLD "0.2.4-build.408703-d88ca3b1"
+		installBSLD "0.2.4-build.408703-d88ca3b1"	# this version modifies the nomad config to avoid losing nomad-parent-container
 		restartBSLD
 		repairNomadParentContainer
 		;;

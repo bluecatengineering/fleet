@@ -195,6 +195,9 @@ restartBSLD() {
 		status=`curl -s -m 1 -w "%{http_code}" http://localhost:8082/api/v1/health`
 	done
 	echo BSLD is healthy
+
+	echo "waiting 60 seconds for services"
+	sleep 60
 }
 
 installBSLC() {

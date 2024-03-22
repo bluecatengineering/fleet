@@ -7,6 +7,9 @@
 
 export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
 
+management_endpoint=$(jq ".managementHttpsEndpoint" --raw-output /opt/bluecat/bsld/conf/node.conf)
+docker_registry_prefix="$management_endpoint:443/library"
+
 cleanVolumes() {
 	fleet res | grep volumes
 	snapshots=`lvs -S 'lv_attr =~ ^s && lv_name =~ [^snap-]' -o lv_name --no-headings`
@@ -77,7 +80,6 @@ repairBSLServices() {
 
 	installed_bsld_version=$(apt list --installed 2> /dev/null | grep sdp-bsld | cut -d ' ' -f2)
 	installed_bslc_version=$(docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]')
-	management_endpoint=$(jq ".managementHttpsEndpoint" --raw-output /opt/bluecat/bsld/conf/node.conf)
 
 	if [[ $current == "v4.5.0" ]]; then
 		bsld_target_version="$bsld_version_450"
@@ -195,6 +197,46 @@ restartBSLD() {
 	echo BSLD is healthy
 }
 
+installBSLC() {
+	echo installing BSLC
+	tag="$1"
+
+	bslc_repo="$docker_registry_prefix/bslc"
+
+	echo "reinstalling BSLC to version $tag"
+	docker pull "$bslc_repo:$tag"
+	docker tag "$bslc_repo:$tag" bslc:local
+
+	echo "BSLC docker image sha256"
+	docker inspect --format='{{.ID}}' bslc:local
+
+	echo "restarting BSLC"
+	if [[ $(docker ps | grep bslc) ]]; then
+		docker kill "$(docker ps | grep bslc | cut -d' ' -f 1)"
+	fi
+
+	timeout=300
+	interval=5
+	counter=0
+	echo "waiting up to $timeout seconds for BSLC"
+	until [[ $(curl -s --write-out '%{http_code}' --output /dev/null localhost:9090/api/v1/health) -eq 200 ]]
+	do
+		if [[ $counter -ge $timeout ]]; then
+			echo "timed out while waiting for BSLC to come up healthy."
+			exit 1
+		fi
+
+		echo "> waiting for BSLC to come up healthy... waiting $interval seconds..."
+
+		((counter=$counter+$interval))
+		sleep $interval
+	done
+
+	echo "BSLC is healthy"
+
+	docker rmi "$bslc_repo:$tag"
+}
+
 
 runHotfixSteps() {
 	current=`fleet version`
@@ -210,6 +252,7 @@ runHotfixSteps() {
 		installBSLD "0.2.4-build.408703-d88ca3b1"	# this version modifies the nomad config to avoid losing nomad-parent-container
 		restartBSLD
 		repairNomadParentContainer
+		installBSLC "0.2.4-build.455237-2f90597b"   # this version modifies service instance job submission to not wait for itself on only load balancer change
 		;;
 	*)
 		echo wrong SP platform version, expected 4.5.x or 4.6.x but got $current

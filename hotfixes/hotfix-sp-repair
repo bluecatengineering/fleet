@@ -216,8 +216,8 @@ installBSLC() {
 	fi
 
 	timeout=300
-    interval=5
-    counter=0
+	interval=5
+	counter=0
 	echo "waiting up to $timeout seconds for BSLC"
     until [[ $(curl -s --write-out '%{http_code}' --output /dev/null localhost:9090/api/v1/health) -eq 200 ]]
     do

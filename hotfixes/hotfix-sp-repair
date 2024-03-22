@@ -219,18 +219,18 @@ installBSLC() {
 	interval=5
 	counter=0
 	echo "waiting up to $timeout seconds for BSLC"
-    until [[ $(curl -s --write-out '%{http_code}' --output /dev/null localhost:9090/api/v1/health) -eq 200 ]]
-    do
-        if [[ $counter -ge $timeout ]]; then
-            echo "timed out while waiting for BSLC to come up healthy."
-            exit 1
-        fi
+	until [[ $(curl -s --write-out '%{http_code}' --output /dev/null localhost:9090/api/v1/health) -eq 200 ]]
+	do
+		if [[ $counter -ge $timeout ]]; then
+			echo "timed out while waiting for BSLC to come up healthy."
+			exit 1
+		fi
 
-        echo "> waiting for BSLC to come up healthy... waiting $interval seconds..."
+		echo "> waiting for BSLC to come up healthy... waiting $interval seconds..."
 
-        ((counter=$counter+$interval))
-        sleep $interval
-    done
+		((counter=$counter+$interval))
+		sleep $interval
+	done
 
 	echo "BSLC is healthy"
 

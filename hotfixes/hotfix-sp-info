@@ -5,8 +5,16 @@
 #
 # usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix sp-info
 
+echo version: `fleet version`
+echo platform: `fleet platform`
+echo env: `fleet env`
+echo customerID: `fleet customer`
+
 echo BSLD version: `apt list --installed 2> /dev/null | grep sdp-bsld | cut -d ' ' -f2`
 echo BSLD checksum: `sha256sum /opt/bluecat/bsld/bin/bsld`
-echo BSLC version: `docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]'`
-echo BSLC checksum: `docker inspect --format='{{.ID}}' bslc:local`
 
+case `fleet version` in
+v4.5*|v4.6*)
+    echo BSLC version: `docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]'`
+    echo BSLC checksum: `docker inspect --format='{{.ID}}' bslc:local`
+esac

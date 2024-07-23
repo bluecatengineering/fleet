@@ -258,8 +258,8 @@ runHotfixSteps() {
 		installBSLC "0.2.4-build.455237-2f90597b"   # this version modifies service instance job submission to not wait for itself on only load balancer change
 		;;
 	*)
-		echo wrong SP platform version, expected 4.5.x or 4.6.x but got $current
-		exit 1
+		echo no issues found, SP platform version is $current
+		exit 0
 	esac
 }
 

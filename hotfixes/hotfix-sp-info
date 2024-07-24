@@ -10,7 +10,7 @@ echo platform: `fleet platform`
 echo env: `fleet env`
 echo customerID: `fleet customer`
 
-echo BSLD version: `apt list --installed 2> /dev/null | grep sdp-bsld | cut -d ' ' -f2`
+echo BSLD version: `apt list --installed 2> /dev/null | grep sdp-bsld | grep -v sdp-bsld-src | cut -d ' ' -f2`
 echo BSLD checksum: `sha256sum /opt/bluecat/bsld/bin/bsld`
 
 case `fleet version` in

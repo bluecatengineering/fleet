@@ -1,0 +1,108 @@
+#!/bin/bash
+# 
+# hotfix cert-renew
+# hotfix to download and activate DRS certificates
+# 
+# usage: ssh [SSH_ARGS] <service-point> sudo /opt/bluecat/bin/hotfix cert-renew
+
+set -euo pipefail
+
+logToAnsible() {
+    # use the ansible logfile because it is pushed to the cloud and commonly consulted for update failures
+    ansibleLog=/var/log/sdp/ansible/ansible.log
+    echo "`date '+%F %T'` p=$$ n=hotfix-cert-renew |" $* >> $ansibleLog
+    echo $*
+}
+
+. /home/operations/.bash_aliases
+
+FLEET_VERSION=`fleet version`
+if ! [[ "$FLEET_VERSION" =~ ^v4.[6-7].*$ ]]; then
+    logToAnsible "Fleet version $FLEET_VERSION is not supported for this hotfix, please upgrade your Service Point"
+    exit 1
+fi
+
+logToAnsible "Beginning renewal of DRS certificates"
+
+SPC_ID=`docker ps -qf "name=sp-controller-service"`
+[[ $SPC_ID != "" ]] || (logToAnsible "Could not find controller container ID" && exit 1)
+CI_URL=`docker inspect "$SPC_ID" | jq -r '.[0].Config.Env[] | select(contains("SP_MANAGER_HOSTNAME"))' | awk -F '=' '{ print $2 }'`
+SUBDOMAIN=`echo "$CI_URL" | awk -F '.' '{ print "http://api." $1 "-m."}'`
+DOMAIN=`echo "$CI_URL" | cut -f 2- -d '.'`
+CI_API_URL="$SUBDOMAIN$DOMAIN"
+logToAnsible "Parsed Edge URL $CI_API_URL"
+
+SPC_IP=`docker inspect "$(docker ps -qf 'name=sp-controller')" | jq -r ".[0].NetworkSettings.Networks.bridge.IPAddress"`
+CERT_EXPIRE=`curl -sS -f "$SPC_IP:2121/v2/diagnostics" | jq '.resources[] | select(.type == "certificates") | .info[] | select(.name == "clientCertificateExpiration") | .value'`
+logToAnsible "Client certificate expiration: $(date -d @$((CERT_EXPIRE / 1000)))"
+CA_EXPIRE=`curl -sS -f "$SPC_IP:2121/v2/diagnostics" | jq '.resources[] | select(.type == "certificates") | .info[] | select(.name == "caCertificateExpiration") | .value'`
+logToAnsible "CA certificate expiration: $(date -d @$((CA_EXPIRE / 1000)))"
+
+if ((CERT_EXPIRE == 0)) || ((CA_EXPIRE == 0)); then
+    logToAnsible "Certificates are not currently loaded, please retry"
+    exit 1
+fi
+
+STATUS_IP=`docker inspect "$(docker ps -qf 'name=status')" | jq -r ".[0].NetworkSettings.Networks.bridge.IPAddress"`
+INSTANCE_ID=`curl -sS -f "$STATUS_IP:2021/v2/diagnostics" | jq -r ".applicationId"`
+logToAnsible "DRS ID: $INSTANCE_ID" 
+
+CLIENT_CERT=`curl -sS -f -x http://169.254.1.1:8700 "$CI_API_URL/ccm/v1/spCertificate/client"`
+CA=`curl -sS -f -x http://169.254.1.1:8700 "$CI_API_URL/ccm/v1/spCertificate/ca"`
+logToAnsible "Retrieved new certificates from Edge"
+
+consul kv put "serviceInstance/$INSTANCE_ID/client.jks" "$CLIENT_CERT"
+logToAnsible "Updated client certificate"
+
+consul kv put "serviceInstance/$INSTANCE_ID/ca.jks" "$CA"
+logToAnsible "Updated CA certificate"
+
+DESCRIPTOR=`consul kv get "descriptors/serviceInstance/$INSTANCE_ID"`
+UPDATED=`echo "$DESCRIPTOR" | jq -c --arg CA "$CA" --arg CERT "$CLIENT_CERT" '.ServiceData."ca.jks" |= $CA | .ServiceData."client.jks" |= $CERT'`
+consul kv put "descriptors/serviceInstance/$INSTANCE_ID" "$UPDATED"
+logToAnsible "Updated DRS descriptor certificates"
+
+maxAttempts=30
+attempts=1
+while true; do
+    if ((attempts > maxAttempts)); then
+        logToAnsible "Took too many tries to reload certificates, please contact customer support"
+        exit 1
+    fi
+    logToAnsible "Reloading certificates, attempt $attempts out of $maxAttempts"
+    UUID=`cat /proc/sys/kernel/random/uuid`
+    exitCode=`curl -w "%{http_code}\n" -s -XPOST "$SPC_IP:2121/renewCertificates?certName=$UUID"`
+    if [ "$exitCode" == "200" ]; then
+        break
+    else
+        logToAnsible "Failed to reload certificates"
+        attempts=$((attempts+1))
+        sleep 5
+    fi
+done
+logToAnsible "Certificate reload triggered, waiting for new certificates to become active"
+
+maxAttempts=30
+attempts=1
+while true; do
+    if ((attempts > maxAttempts)); then
+        logToAnsible "Took too long to update certificates, please contact customer support"
+        exit 1
+    fi
+
+    logToAnsible "Checking for updated certificates to become active, attempt $attempts out of $maxAttempts"
+
+    NEW_CERT_EXPIRE=`curl -sS "$SPC_IP:2121/v2/diagnostics" | jq -r '.resources[] | select(.id == "certificates") | .info[] | select(.name=="clientCertificateExpiration") | .value'`
+    NEW_CA_EXPIRE=`curl -sS "$SPC_IP:2121/v2/diagnostics" | jq -r '.resources[] | select(.id == "certificates") | .info[] | select(.name=="caCertificateExpiration") | .value'`
+
+    if ((NEW_CERT_EXPIRE > CERT_EXPIRE)) && ((NEW_CA_EXPIRE > $CA_EXPIRE)); then 
+        logToAnsible "Updated certificates are in use with new expiry times (client: $(date -d @$((NEW_CERT_EXPIRE / 1000))), ca: $(date -d @$((NEW_CA_EXPIRE / 1000))))"
+        break
+    fi
+    
+    logToAnsible "Old certificates are still in use (client: $(date -d @$((NEW_CERT_EXPIRE / 1000))), ca: $(date -d @$((NEW_CA_EXPIRE / 1000)))))"
+    attempts=$((attempts+1))
+    sleep 5
+done
+
+logToAnsible "DRS Certificate renewal was completed successfully"

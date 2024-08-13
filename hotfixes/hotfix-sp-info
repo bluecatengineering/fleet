@@ -18,3 +18,13 @@ v4.5*|v4.6*)
     echo BSLC version: `docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]'`
     echo BSLC checksum: `docker inspect --format='{{.ID}}' bslc:local`
 esac
+
+case `fleet version` in
+v4.7*|v4.6.2)
+    exit 0
+    ;;
+*)
+    # removed the cached hotfix, so we will pull down new versions in the future
+    (sleep 2; rm -f /home/operations/hotfixes/hotfix-sp-info)
+    ;;
+esac

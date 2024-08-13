@@ -5,236 +5,12 @@
 #
 # usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix sp-checkup
 
-recommendedVersion=v4.7.0
-
 shift
 customerSubdomain=""
-customerRegion=""
-spVersion=`fleet version`
-echo servicePointID: `fleet id`
-echo version: $spVersion
-echo platform: `fleet platform` env: `fleet env`
-echo customerID: `fleet customer`
-
-bsldVersion=`apt list --installed 2> /dev/null | grep sdp-bsld | grep -v sdp-bsld-src | cut -d ' ' -f2`
-bsldChecksum=`sha256sum /opt/bluecat/bsld/bin/bsld | awk '{print $1}'`
-
-case "$spVersion" in
-v4.5*|v4.6*)
-    bslcVersion=`docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]'`
-    bslcChecksum=`docker inspect --format='{{.ID}}' bslc:local`
-esac
-
-TEMPF=/tmp/cust-temp.$$.tmp
-TEMPF2=/tmp/cust-tmp.$$.tmp
-
-cleanUpOnExit() {
-    rm -rf $TEMPF $TEMPF2
-}
-
-checkVersions() {
-    expectedBslcVersion=""
-
-    case "$spVersion" in
-    v4.7.0)
-        expectedBsldVersion=0.2.4-build.491289-ed287d2b
-        expectedBsldChecksum=60af25e2229a4363011c9df0274614130de98590a38d64f90609bcabdf4e0913
-        ;;
-    v4.6.2)
-        expectedBsldVersion=0.2.4-build.420007-9a7027b3
-        expectedBsldChecksum=748220dbebb75c6f978e29b8afd1cd1c8bee681778e45af52e733adce0d3097a
-        expectedBslcVersion=0.2.4-build.432353-c76bc938
-        expectedBslcChecksum=sha256:888e341ff4a1ba4ff343b18b3a675e6cc8780a329a670aa6461b46e764dc9045
-        ;;
-    v4.6.1)
-        expectedBsldVersion=0.2.4-build.385996-cd4b6df1
-        expectedBsldChecksum=93503bf5e7c973d4ca69dac1b48fe33254a4bf3a0fd02c1cc790ef8c58fb0597
-        expectedBslcVersion=0.2.4-build.387679-d5328e36
-        expectedBslcChecksum=sha256:473cb34c71ddc44dd0ab90faf49278e81e79195ca4464a086e986156fadfa1cb
-        ;;
-    v4.6.0)
-        expectedBsldVersion=0.2.4-build.371117-df002ae9
-        expectedBsldChecksum=03c8f216dbfebfd3ed39f7c63fa0544eccc71f6549fd3666453e45180b27635b
-        expectedBslcVersion=0.2.4-build.371214-346712cc
-        expectedBslcChecksum=sha256:cdc1c6bfd8b11d4fe8def20337c9e671daede715c4aa7ccb3ef06d2b43712b14
-        ;;
-    v4.5.1)
-        expectedBsldVersion=0.2.4-build.341384-579b13f7
-        expectedBsldChecksum=d3ab3a296d8009d964e7a788ad1dbc1b896ea6925065b9cb265d46605d84140a
-        expectedBslcVersion=0.2.4-build.323884-63ac0d26
-        expectedBslcChecksum=sha256:2bad4408faacb6abd67f71f06072c1a9977fb867d7b3e2a971c8a769893a088b
-        ;;
-    v4.5.0)
-        expectedBsldVersion=0.2.4-build.327491-e1163ff8
-        expectedBsldChecksum=a5352a0eef490b15c542cf35a00aee981a45798ff2cff386c584e3f94b7f7d40
-        expectedBslcVersion=0.2.4-build.323884-63ac0d26
-        expectedBslcChecksum=sha256:2bad4408faacb6abd67f71f06072c1a9977fb867d7b3e2a971c8a769893a088b
-        ;;
-    *)
-        echo BSLD version: $bsldVersion
-        echo BSLD checksum: $bsldChecksum
-        echo BSLC version: $bslcVersion
-        echo BSLC checksum: $bslcChecksum
-        return
-        ;;
-    esac
-
-    if ! test $bsldVersion = $expectedBsldVersion; then
-        echo alert: wrong BSLD version: $bsldVersion
-    fi
-    if ! test $bsldChecksum = $expectedBsldChecksum; then
-        echo alert: wrong BSLD checksum: $bsldChecksum
-    fi
-
-    if test -n "$expectedBslcVersion"; then
-        if ! test $bslcVersion = $expectedBslcVersion; then
-            echo alert: wrong BSLC version: $bslcVersion
-        fi
-        if ! test $bslcChecksum = $expectedBslcChecksum; then
-            echo alert: wrong BSLC checksum: $bslcChecksum
-        fi
-    fi
-}
-
-checkForIssues() {
-    curl -s -m 60 --noproxy localhost http://localhost:8083/api/v1/diagnostics?full=false > $TEMPF
-
-    servicePointID=`jq -r .id $TEMPF`
-    status=`jq -r .status $TEMPF`
-    connectionStatus=`jq -r .connectionStatus $TEMPF`
-    targetVersion=`jq -r .targetVersion $TEMPF`
-    updateStatus=`jq -r .updateStatus $TEMPF`
-    ntpStatus=`jq -r .ntpStatus $TEMPF`
-    ntpSync=`echo $ntpStatus | jq -r .synchronized`
-    dnsServers=`jq -r .dnsServers $TEMPF`
-    dnsServerList=`jq -r .dnsServers $TEMPF | sed s/\"//g | sed s/,// | egrep -v '\[|\]'`
-    addresses=`jq -r .addresses $TEMPF`
-    jq -r .addresses $TEMPF | grep ipAddress | sed s/\"//g | sed s/,// | sed 's/ipAddress: //' > $TEMPF2
-    addressesList=`cat $TEMPF2`
-
-    if ! test -s $TEMPF; then
-        echo alert: failed to get SP diagnostics
-        status=UNKNOWN
-        connectionStatus=UNKNOWN
-        ntpSync=UNKNOWN
-    fi
-
-    case "$spVersion" in
-    v4.4*|v4.5*)
-        echo alert: SP $spVersion is no longer supported. Recommend update to $recommendedVersion
-        ;;
-    v4.6.2)
-        ;;
-    v4.6*)
-        echo warning: SP $spVersion has known issues. Recommend update to $recommendedVersion
-        ;;
-    esac
-
-    if ! test "$status" = HEALTHY; then
-        echo alert: SP status: $status
-    fi
-    problems --healthcheck | sed 's/^/errorCondition: /'
-
-    if ! test "$connectionStatus" = CONNECTED; then
-        echo warning: SP connectionStatus: $connectionStatus
-    fi
-    if ! test "$ntpSync" = true; then
-        echo warning: ntpSynchronized: $ntpSync
-    fi
-
-    if test "$updateStatus" = UPDATE_FAILED; then
-        echo warning: SP targetVersion: $targetVersion updateStatus: $updateStatus
-    fi
-
-    for dnsServer in $dnsServerList; do
-        if grep $dnsServer $TEMPF2 > /dev/null; then
-            echo warning: SP is using dnsServer $dnsServer which is on the same SP
-        fi
-    done
-
-    lsof -n > $TEMPF 2>/dev/null
-    fluentbitFileDescriptors=`grep fluentbit $TEMPF | wc -l`
-    if test $fluentbitFileDescriptors -gt 3300; then
-        echo alert: fluentbit is using too many file descriptors, $fluentbitFileDescriptors to be exact
-    fi
-    if test $fluentbitFileDescriptors = 0; then
-        echo alert: fluentbit is not running
-    fi
-
-    logDir=/var/log/sdp
-    logFile=$logDir/journald_docker/journald_docker.log
-    firehoseErrors=`grep 'posting to firehose failed' $logFile | wc -l`
-    if test $firehoseErrors -gt 0; then
-        echo alert: found $firehoseErrors firehose errors in $logFile
-    fi
-
-    componentDir=$logDir/bsld
-    pingErrors=`grep 'could not ping management' $componentDir/* | wc -l`
-    if test $pingErrors -gt 0; then
-        echo alert: found $pingErrors fleet management connectivity errors in $componentDir
-    fi
-
-    componentDir=$logDir/fluentbit
-    fluentbitErrors=`egrep 'failed|broken' $componentDir/* 2>/dev/null | wc -l`
-    if test $fluentbitErrors -gt 0; then
-        echo alert: found $fluentbitErrors fluentbit errors in $componentDir
-    fi
-
-    componentDir=$logDir/telegraf
-    telegrafErrors=`grep 'Error writing to outputs' $componentDir/* | wc -l`
-    if test $telegrafErrors -gt 0; then
-        echo alert: found $telegrafErrors telegraf errors in $componentDir
-    fi
-}
-
-checkDeployedServices() {
-    serviceVolumes=`(cd /svcVols; echo *)`
-    for serviceId in $serviceVolumes; do
-        if test -e /svcVols/$serviceId; then
-            fleet svc $serviceId > $TEMPF
-            if test -s $TEMPF; then
-                ServiceName=`jq -r .ServiceName $TEMPF`
-                Version=`jq -r .Version $TEMPF`
-                IngressEndpoints=`jq -r .IngressEndpoints $TEMPF`
-                echo info: SP is running service $ServiceName-$Version service-instance-id is $serviceId
-                if test "$ServiceName" = dns-resolver-service; then
-                    drsAddr=`jq -r .IngressEndpoints $TEMPF | jq -r .[0].Addresses | egrep -v ':|\[|\]' | sed s/\"//g | sed s/,// | head -1`
-                    # echo DRS listen address: $drsAddr
-                    drsDiagUrl=http://$drsAddr:2021/v2/diagnostics
-                    curl -s $drsDiagUrl > $TEMPF2
-                    if test -s $TEMPF2; then
-                        status=`jq -r .status $TEMPF2`
-                        
-                        if test "$status" = "BAD"; then
-                            echo alert: DRS status: $status
-                            jq -r '.services[] | .id + ": " + .status'  $TEMPF2 | sed 's/^/    /'
-                            jq -r .services[].resourceDetails $TEMPF2 | grep -v null | sed 's/^/    /'
-                        else
-                            echo info: DRS status: $status
-                        fi
-                    else
-                        echo alert: DRS diagnostics empty from $drsDiagUrl
-                    fi
-                fi
-            fi
-        fi
-    done
-}
-
-trap cleanUpOnExit EXIT
-
-checkVersions
-checkForIssues
-checkDeployedServices
-
-# cat reachability warnings > /tmp/checkup-new
-
-case "$spVersion" in
-v4.7*)
-    warnings
-    reachability
-    exit 0
-esac
+echo BSLD version: `apt list --installed 2> /dev/null | grep sdp-bsld | cut -d ' ' -f2`
+echo BSLD checksum: `sha256sum /opt/bluecat/bsld/bin/bsld`
+echo BSLC version: `docker inspect bslc:local | jq -r '.[].Config.Labels["com.bluecatnetworks.build"]'`
+echo BSLC checksum: `docker inspect --format='{{.ID}}' bslc:local`
 
 #!/bin/bash
 # reachability - verifies a service point can reach all required cloud endpoints
@@ -242,11 +18,9 @@ esac
 # Changes
 # 4.6.2: reachability script was introduced
 # 4.7.0: added "-v" flag for verbose mode and "-c customer-subdomain" flag for testing CI connectivity
-# 4.7.0: improved error handling when the SP has not registered yet
-# 4.7.0: auto-discover the customer-subdomain and test connectivity to AWS Firehose
 
 usage() {
-    echo 'usage: reachability [-v] [--healthcheck] [-e env] [-c customer-subdomain] [-r customer-region]'
+    echo 'usage: reachability [-v] [--healthcheck] [-e env] [-c customer-subdomain]'
     exit 0
 }
 
@@ -254,7 +28,6 @@ export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
 TIMEFORMAT=%R;
 TMP=/tmp/reachability.$USER.$$
 cacert=/usr/local/share/ca-certificates/sdp-dev-server-ca.crt
-NODE_CONF_FILE=/opt/bluecat/bsld/conf/node.conf
 
 sudoCmd=sudo
 if test `whoami` = root; then
@@ -291,22 +64,12 @@ while test $# -gt 0; do
 		customerSubdomain=$2
 		shift
 		;;
-	-r)
-		customerRegion=$2
-		shift
-		;;
 	*)
 		echo 'flag not recognized: ' $1
 		usage
 	esac
 	shift
 done
-
-if test $fleetEnv = "unknown"; then
-    echo cannot test reachability when environment is unknown
-    echo you could try: reachability -e us
-    exit 0
-fi
 
 vertexEnv=$fleetEnv
 rootDomain=bluecat.io
@@ -333,12 +96,8 @@ eu-integration)
     vertexEnv=alpha
     cacert=/usr/local/share/ca-certificates/sdp-dev-server-ca2.crt
     ;;
-dev*|integration)
+dev*|integration|alpha)
     vertexEnv=alpha
-    ;;
-alpha)
-    vertexEnv=alpha
-    ciDomain=alpha.bluec.at
     ;;
 esac
 
@@ -385,7 +144,7 @@ esac
 notaryBundle=/home/egw/bundle.pem
 
 if ! test -f $notaryBundle; then
-    # echo error: cannot test mTLS endpoints without $notaryBundle
+    echo error: cannot test mTLS endpoints without $notaryBundle
     exit 1
 fi
 
@@ -411,28 +170,10 @@ case $response in
     ;;
 esac
 
-if test -z "$customerSubdomain"; then
-    # try to derive CI domain from DRS-3.11 diagnostics
-    exposedIP=`head -1 /opt/bluecat/bsld/conf/node_ips`
-    curl -s -m 60 --noproxy $exposedIP http://${exposedIP}:2021/v2/diagnostics 2>/dev/null > $TMP
-
-    if test -s $TMP; then
-        drsVersion=$(jq -r ".currentVersion" ${TMP})
-        major=$(echo $drsVersion | cut -d '.' -f1)
-        minor=$(echo $drsVersion | cut -d '.' -f2)
-
-        if [ $major -gt 3 ] | [ $minor -ge 11 ]; then
-            customerHostname=$(jq -r ".registration.customerHostname" ${TMP})
-            customerSubdomain=$(echo "$customerHostname" | cut -d '.' -f1)
-            # echo DRS $drsVersion detected, found customerSubdomain: $customerSubdomain in $customerHostname
-        fi
-    fi
-fi
-
 if test -n "$customerSubdomain"; then
     mtlsCustomerDomain=api.$customerSubdomain-m.$ciDomain
     mtlsCustomerUrl=https://$mtlsCustomerDomain/ims/v1/identities
-
+    
     elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert $notaryKey --key $notaryCert $mtlsCustomerUrl > $TMP) 2>&1`
     response=`cat $TMP`
     case $response in
@@ -450,49 +191,14 @@ fi
 
 $sudoCmd rm -rf $notaryCert $notaryKey
 
-if test -z "$customerRegion"; then
-    case $fleetEnv in
-    eu*)
-        customerRegion=eu-central-1
-        ;;
-    *)
-        customerRegion=us-west-2
-        ;;
-    esac
-fi
-
-if test -n "$customerRegion"; then
-    testURL=https://firehose.$customerRegion.amazonaws.com
-
-    elapsed=`time (with-proxy curl -s --max-time 5 $testURL > $TMP) 2>&1`
-    response=`cat $TMP`
-    case $response in
-        healthy)
-            echoIfNotHealthcheck "good response from Firehose $testURL in $elapsed seconds"
-            ;;
-        *)
-            echo "warning: bad response from Firehose $testURL- got $response in $elapsed seconds"
-            if test $verbose == true; then
-                with-proxy curl -v --max-time 5 $testURL
-            fi
-            ;;
-    esac
-fi
-
 URL=https://service-layer.$fleetEnv.fleet.bluec.at/packages/pool/main/d/docker-ce
 PKG=docker-ce-cli_5%3a24.0.7-1~debian.11~bullseye_amd64.deb
 URL_ENCODED=$URL/$(echo $PKG | tr -d '\n' | jq -sRr @uri)
 
-elapsed=`time (with-proxy curl -s --max-time 15  \
+elapsed=`time (with-proxy curl -s --max-time 5 \
     --key /opt/bluecat/apt/etc/certs/managementKey.pem \
     --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
     --cacert $cacert $URL_ENCODED > $TMP) 2>&1`
-
-if [ $? = 28 ]; then
-    echo warning: timed out downloading speed test file from $URL_ENCODED
-    rm -f $TMP
-    exit 0
-fi
 
 fileSize=`du -sk $TMP | awk '{print $1}'`
 
@@ -601,18 +307,9 @@ checkNameservers() {
     fi
 }
 
-checkCustomerMetrics() {
-    curl -s http://localhost:8083/api/v1/metrics > $TMP
-    lines=`wc -l $TMP | awk '{print $1}'`
-    if test $lines -lt 200; then
-        echo "warning: Fleet SP telemetry-api service is not healthy"
-    fi
-}
-
 checkNameservers
 checkPartition / /var /svcVols/*
 checkCerts
-checkCustomerMetrics
 
 case `fleet platform` in
 bdds*)

@@ -5,7 +5,7 @@
 #
 # usage: ssh [SSH_ARGS] <service-point> sudo -E env "PATH=$PATH:/opt/bluecat/bin/" hotfix check
 
-recommendedVersion=v4.7.0
+recommendedVersion=v4.7.1
 
 shift
 customerSubdomain=""
@@ -36,8 +36,18 @@ cleanUpOnExit() {
 
 checkVersions() {
     expectedBslcVersion=""
+    expectedBsldVersion2=""
+    expectedBsldChecksum2=""
 
     case "$spVersion" in
+    v4.7.1)
+        # version shipped in 4.7.0 -> 4.7.1 update
+        expectedBsldVersion=0.2.4-build.517907-54b04ff3
+        expectedBsldChecksum=c31b777e6438be73bacc67bc9e5a5e3fc5b98a021d82005e568bc8c49e6ab832
+        # version shipped in 4.6.0 -> 4.7.1 update and 4.7.1 installer
+        expectedBsldVersion2=0.2.4-build.523281-91a0cad6
+        expectedBsldChecksum2=3f189146fbf21a1feb1ec7d4aa26c52df6ceb268346528451b6e08f6275662c6
+        ;;
     v4.7.0)
         expectedBsldVersion=0.2.4-build.491289-ed287d2b
         expectedBsldChecksum=60af25e2229a4363011c9df0274614130de98590a38d64f90609bcabdf4e0913
@@ -72,6 +82,11 @@ checkVersions() {
         expectedBslcVersion=0.2.4-build.323884-63ac0d26
         expectedBslcChecksum=sha256:2bad4408faacb6abd67f71f06072c1a9977fb867d7b3e2a971c8a769893a088b
         ;;
+    v4.7*|v4.8*|v9*|unknown)
+        echo BSLD version: $bsldVersion
+        echo BSLD checksum: $bsldChecksum
+        return
+        ;;
     *)
         echo BSLD version: $bsldVersion
         echo BSLD checksum: $bsldChecksum
@@ -81,10 +96,10 @@ checkVersions() {
         ;;
     esac
 
-    if ! test $bsldVersion = $expectedBsldVersion; then
+    if ! test $bsldVersion = $expectedBsldVersion && ! test $bsldVersion = $expectedBsldVersion2; then
         echo alert: wrong BSLD version: $bsldVersion
     fi
-    if ! test $bsldChecksum = $expectedBsldChecksum; then
+    if ! test $bsldChecksum = $expectedBsldChecksum && ! test $bsldChecksum = $expectedBsldChecksum2; then
         echo alert: wrong BSLD checksum: $bsldChecksum
     fi
 
@@ -113,6 +128,11 @@ checkForIssues() {
     addresses=`jq -r .addresses $TEMPF`
     jq -r .addresses $TEMPF | grep ipAddress | sed s/\"//g | sed s/,// | sed 's/ipAddress: //' > $TEMPF2
     addressesList=`cat $TEMPF2`
+    platform=`jq -r .platform $TEMPF`
+    resources=`hardware-resources -v | grep -v fleet/cluster | jq -r .resources`
+    totalMemory=`echo $resources  | jq -r .memory.totalMB`
+    cpuCores=`echo $resources  | jq -r .cpu.cores`
+    # echo resources: totalMemory: $totalMemory, cpuCores: $cpuCores, resources: $resources
 
     if ! test -s $TEMPF; then
         echo alert: failed to get SP diagnostics
@@ -123,12 +143,12 @@ checkForIssues() {
 
     case "$spVersion" in
     v4.4*|v4.5*)
-        echo alert: SP $spVersion is no longer supported. Recommend update to $recommendedVersion
+        echo alert: SP $spVersion is end of life. Recommend upgrade to $recommendedVersion
         ;;
     v4.6.2)
         ;;
     v4.6*)
-        echo warning: SP $spVersion has known issues. Recommend update to $recommendedVersion
+        echo warning: SP $spVersion has known issues. Recommend upgrade to $recommendedVersion
         ;;
     esac
 
@@ -144,15 +164,39 @@ checkForIssues() {
         echo warning: ntpSynchronized: $ntpSync
     fi
 
+    case $platform in
+    none|bdds-vmware|disabled)
+        echo warning: unrecognized platform: $platform
+        ;;
+    esac
+
     if test "$updateStatus" = UPDATE_FAILED; then
         echo warning: SP targetVersion: $targetVersion updateStatus: $updateStatus
     fi
 
     for dnsServer in $dnsServerList; do
         if grep $dnsServer $TEMPF2 > /dev/null; then
-            echo warning: SP is using dnsServer $dnsServer which is on the same SP
+            echo warning: SP is using resolver $dnsServer which is on the same SP
         fi
     done
+
+    # SP requires: 8 GB of memory, 4 vCPUs, 100 GB of disk space
+    # SP on ENCS:  3 GB of memory, 2 CPU cores, and 15 GB of disk space
+    memoryRequired=7593	# 8 GB minus hypervisor overhead
+    cpusRequired=4
+    if test $platform = encs; then
+        memoryRequired=2975
+        cpusRequired=2
+    fi
+
+    if test -n "$totalMemory" && ! test "$totalMemory" = null && test $totalMemory -lt $memoryRequired; then
+        echo warning: insufficient memory $totalMemory MB
+    fi
+    if test -n "$cpuCores" && ! test "$cpuCores" = null && test $cpuCores -lt $cpusRequired; then
+        echo warning: insufficient cpu cores $cpuCores
+    fi
+
+    checkDeployedServices $TEMPF
 
     lsof -n > $TEMPF 2>/dev/null
     fluentbitFileDescriptors=`grep fluentbit $TEMPF | wc -l`
@@ -164,40 +208,53 @@ checkForIssues() {
     fi
 
     logDir=/var/log/sdp
+
+    # when checking logs, want the most significant errors at the top of the report
+    logFile=$logDir/admin.log
+    adminErrors=`grep -i error $logFile | wc -l`
+    if test $adminErrors -gt 0; then
+        echo alert: found $adminErrors errors in $logFile
+    fi
+
+    componentDir=$logDir/nomad
+    nomadHeartbeatErrors=`grep 'missed heartbeat' $componentDir/* | wc -l`
+    if test $nomadHeartbeatErrors -gt 0; then
+        echo alert: found $nomadHeartbeatErrors missed heartbeat errors in $componentDir
+    fi
+    nomadPullErrors=`grep 'failed pulling container' $componentDir/* | wc -l`
+    if test $nomadPullErrors -gt 0; then
+        echo warning: found $nomadPullErrors nomad image pull errors in $componentDir
+    fi
+
+    # below here, they are all basically connectivity errors, so group them together
     logFile=$logDir/journald_docker/journald_docker.log
     firehoseErrors=`grep 'posting to firehose failed' $logFile | wc -l`
     if test $firehoseErrors -gt 0; then
-        echo alert: found $firehoseErrors firehose errors in $logFile
+        echo warning: found $firehoseErrors firehose errors in $logFile
     fi
 
     componentDir=$logDir/journald_docker
     dockerPullErrors=`grep 'Not continuing with pull after error' $componentDir/* | wc -l`
     if test $dockerPullErrors -gt 0; then
-        echo alert: found $dockerPullErrors docker image pull errors in $componentDir
-    fi
-
-    componentDir=$logDir/nomad
-    nomadPullErrors=`grep 'failed pulling container' $componentDir/* | wc -l`
-    if test $nomadPullErrors -gt 0; then
-        echo alert: found $nomadPullErrors nomad image pull errors in $componentDir
+        echo warning: found $dockerPullErrors docker image pull errors in $componentDir
     fi
 
     componentDir=$logDir/bsld
     pingErrors=`grep 'could not ping management' $componentDir/* | wc -l`
     if test $pingErrors -gt 0; then
-        echo alert: found $pingErrors fleet management connectivity errors in $componentDir
+        echo warning: found $pingErrors fleet management connectivity errors in $componentDir
     fi
 
     componentDir=$logDir/fluentbit
     fluentbitErrors=`egrep 'failed|broken' $componentDir/* 2>/dev/null | wc -l`
     if test $fluentbitErrors -gt 0; then
-        echo alert: found $fluentbitErrors fluentbit errors in $componentDir
+        echo warning: found $fluentbitErrors fluentbit errors in $componentDir
     fi
 
     componentDir=$logDir/telegraf
     telegrafErrors=`grep 'Error writing to outputs' $componentDir/* | wc -l`
     if test $telegrafErrors -gt 0; then
-        echo alert: found $telegrafErrors telegraf errors in $componentDir
+        echo warning: found $telegrafErrors telegraf errors in $componentDir
     fi
 
     case "$customerID" in
@@ -207,50 +264,103 @@ checkForIssues() {
     esac
 }
 
-checkDeployedServices() {
-    serviceVolumes=`(cd /svcVols; echo *)`
-    for serviceId in $serviceVolumes; do
-        if test -e /svcVols/$serviceId; then
-            fleet svc $serviceId > $TEMPF
-            if test -s $TEMPF; then
-                ServiceName=`jq -r .ServiceName $TEMPF`
-                Version=`jq -r .Version $TEMPF`
-                IngressEndpoints=`jq -r .IngressEndpoints $TEMPF`
-                echo info: SP is running service $ServiceName-$Version service-instance-id is $serviceId
-                if test "$ServiceName" = dns-resolver-service; then
-                    drsAddr=`jq -r .IngressEndpoints $TEMPF | jq -r .[0].Addresses | egrep -v ':|\[|\]' | sed s/\"//g | sed s/,// | head -1`
-                    # echo DRS listen address: $drsAddr
-                    drsDiagUrl=http://$drsAddr:2021/v2/diagnostics
-                    curl -s $drsDiagUrl > $TEMPF2
-                    if test -s $TEMPF2; then
-                        status=`jq -r .status $TEMPF2`
-                        
-                        if test "$status" = "BAD"; then
-                            echo alert: DRS status: $status
-                            jq -r '.services[] | .id + ": " + .status'  $TEMPF2 | sed 's/^/    /'
-                            jq -r .services[].resourceDetails $TEMPF2 | grep -v null | sed 's/^/    /'
-                        else
-                            echo info: DRS status: $status
-                        fi
-                    else
-                        echo alert: DRS diagnostics empty from $drsDiagUrl
-                    fi
-                fi
+checkServiceIfDRS() {
+    serviceId=$1
+    serviceName=$2
+    # TODO: we can simplify this after all customers update to > 4.6.0
+    case $spVersion in
+    v4.5*)
+        consul kv get -recurse descriptors/serviceInstance/$serviceId | sed "s/^.*$serviceId://" | jq > $TEMPF2
+        ;;
+    *)
+        fleet svc $serviceId > $TEMPF2
+        ;;
+    esac
+
+    if test "$serviceName" = dns-resolver-service; then
+        drsAddr=`jq -r .IngressEndpoints $TEMPF2 | jq -r .[0].Addresses | egrep -v ':|\[|\]' | sed s/\"//g | sed s/,// | head -1`
+        # echo DRS listen address: $drsAddr
+        drsDiagUrl=http://$drsAddr:2021/v2/diagnostics
+        curl -s $drsDiagUrl > $TEMPF2
+        if test -s $TEMPF2; then
+            status=`jq -r .status $TEMPF2`
+
+            if test "$status" = "BAD"; then
+                echo alert: DRS diagnostics reporting status: $status for $serviceName-$serviceVersion id: $serviceId
+                jq -r '.services[] | .id + ": " + .status'  $TEMPF2 | sed 's/^/    /'
+                jq -r .services[].resourceDetails $TEMPF2 | grep -v null | sed 's/^/    /'
+            else
+                echo info: DRS diagnostics reporting status: $status for $serviceName-$serviceVersion id: $serviceId
             fi
+        else
+            echo alert: DRS diagnostics empty from $drsDiagUrl for $serviceName-$serviceVersion id: $serviceId
         fi
-    done
+    fi
+}
+
+checkDeployedServices() {
+    if ! test -e /svcVols; then
+        return
+    fi
+
+    spFile=$1
+
+    serviceName=`jq -r '.services[0].serviceName' $spFile`
+    if test "$serviceName" = null; then
+        return	# no services deployed to this SP
+    fi
+    serviceId=`jq -r '.services[0].id' $spFile`
+    serviceErrors=`jq -r '.services[0].errorConditions' $spFile`
+    serviceVersion=`jq -r '.services[0].version' $spFile`
+    serviceStatus=`jq -r '.services[0].status' $spFile`
+    if test "$serviceStatus" = UNHEALTHY; then
+        echo alert: unhealthy service $serviceName-$serviceVersion id: $serviceId serviceErrors: $serviceErrors
+    else
+        echo info: healthy service $serviceName-$serviceVersion id: $serviceId
+    fi
+    checkServiceIfDRS $serviceId $serviceName $serviceVersion
+
+    serviceName=`jq -r '.services[1].serviceName' $spFile`
+    if test "$serviceName" = null; then
+        return	# no other services deployed to this SP
+    fi
+    serviceId=`jq -r '.services[1].id' $spFile`
+    serviceErrors=`jq -r '.services[1].errorConditions' $spFile`
+    serviceVersion=`jq -r '.services[1].version' $spFile`
+    serviceStatus=`jq -r '.services[1].status' $spFile`
+    if test "$serviceStatus" = UNHEALTHY; then
+        echo alert: unhealthy service $serviceName-$serviceVersion id: $serviceId serviceErrors: $serviceErrors
+    else
+        echo info: healthy service $serviceName-$serviceVersion id: $serviceId
+    fi
+    checkServiceIfDRS $serviceId $serviceName $serviceVersion
+
+    serviceName=`jq -r '.services[2].serviceName' $spFile`
+    if test "$serviceName" = null; then
+        return	# no other services deployed to this SP
+    fi
+    serviceId=`jq -r '.services[2].id' $spFile`
+    serviceErrors=`jq -r '.services[2].errorConditions' $spFile`
+    serviceVersion=`jq -r '.services[2].version' $spFile`
+    serviceStatus=`jq -r '.services[2].status' $spFile`
+    if test "$serviceStatus" = UNHEALTHY; then
+        echo alert: unhealthy service $serviceName-$serviceVersion id: $serviceId serviceErrors: $serviceErrors
+    else
+        echo info: healthy service $serviceName-$serviceVersion id: $serviceId
+    fi
+    checkServiceIfDRS $serviceId $serviceName $serviceVersion
 }
 
 trap cleanUpOnExit EXIT
 
 checkVersions
 checkForIssues
-checkDeployedServices
 
 # cat reachability warnings > /tmp/checkup-new
 
+# TODO: we can delete the embedded reachability and warnings scripts after all customers update to > 4.7.1
 case "$spVersion" in
-v4.7*)
+v4.7.1|v4.7.2|v4.8.*)
     warnings
     reachability
     exit 0
@@ -265,6 +375,7 @@ esac
 # 4.7.0: added "-v" flag for verbose mode and "-c customer-subdomain" flag for testing CI connectivity
 # 4.7.0: improved error handling when the SP has not registered yet
 # 4.7.0: auto-discover the customer-subdomain and test connectivity to AWS Firehose
+# 4.7.1: refactor via shell functions to avoid exiting prematurely in case of errors
 
 usage() {
     echo 'usage: reachability [-v] [--healthcheck] [-e env] [-c customer-subdomain] [-r customer-region]'
@@ -363,186 +474,209 @@ alpha)
     ;;
 esac
 
-pingUrl=https://service-layer.$fleetEnv.fleet.bluec.at/ping
-elapsed=`time (with-proxy curl -s --max-time 5 \
-    --key /opt/bluecat/apt/etc/certs/managementKey.pem \
-    --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
-    --cacert $cacert $pingUrl > $TMP) 2>&1`
-
-response=`cat $TMP`
-expectedResponse="OK"
-if ! test "$response" = "$expectedResponse"; then
-    echo warning: bad response from Fleet $pingUrl - expected $expectedResponse but got $response in $elapsed seconds
-    if test $verbose == true; then
-        with-proxy curl -v --max-time 5 \
+checkFleetReachability() {
+    pingUrl=https://service-layer.$fleetEnv.fleet.bluec.at/ping
+    elapsed=`time (with-proxy curl -s --max-time 5 \
         --key /opt/bluecat/apt/etc/certs/managementKey.pem \
         --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
-        --cacert $cacert $pingUrl
-    fi
-else
-    echoIfNotHealthcheck good response from Fleet $pingUrl in $elapsed seconds
-fi
+        --cacert $cacert $pingUrl > $TMP) 2>&1`
 
-vertexUrl=https://vertex.$vertexEnv.$rootDomain
-mtlsVertexUrl=https://vertex-m.$vertexEnv.$rootDomain
-
-testUrl=$vertexUrl/v1/jwks
-elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" $testUrl > $TMP) 2>&1`
-
-response=`cat $TMP`
-expectedResponse="200"
-case $response in
-*200)
-    echoIfNotHealthcheck good response from Notary-TLS $testUrl in $elapsed seconds
-    ;;
-*)
-    echo warning: bad response from Notary-TLS $testUrl - expected $expectedResponse but got $response in $elapsed seconds
-    if test $verbose == true; then
-        with-proxy curl -v --max-time 5 $testUrl
-    fi
-    ;;
-esac
-
-notaryBundle=/home/egw/bundle.pem
-
-if ! test -f $notaryBundle; then
-    # echo error: cannot test mTLS endpoints without $notaryBundle
-    exit 1
-fi
-
-notaryCert=xx00
-notaryKey=xx01
-$sudoCmd rm -rf $notaryCert $notaryKey
-$sudoCmd csplit --silent $notaryBundle '/-----BEGIN CERTIFICATE-----/'
-
-testUrl=$mtlsVertexUrl/v1/jwt
-elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert $notaryKey --key $notaryCert $testUrl > $TMP) 2>&1`
-
-response=`cat $TMP`
-expectedResponse="200"
-case $response in
-*200)
-    echoIfNotHealthcheck good response from Notary-mTLS $testUrl in $elapsed seconds
-    ;;
-*)
-    echo warning: bad response from Notary-mTLS $testUrl - expected $expectedResponse but got $response in $elapsed seconds
-    if test $verbose == true; then
-        with-proxy curl -v --max-time 5 --cert $notaryKey --key $notaryCert $testUrl
-    fi
-    ;;
-esac
-
-if test -z "$customerSubdomain"; then
-    # try to derive CI domain from DRS-3.11 diagnostics
-    exposedIP=`head -1 /opt/bluecat/bsld/conf/node_ips`
-    curl -s -m 60 --noproxy $exposedIP http://${exposedIP}:2021/v2/diagnostics 2>/dev/null > $TMP
-
-    if test -s $TMP; then
-        drsVersion=$(jq -r ".currentVersion" ${TMP})
-        major=$(echo $drsVersion | cut -d '.' -f1)
-        minor=$(echo $drsVersion | cut -d '.' -f2)
-
-        if [ $major -gt 3 ] | [ $minor -ge 11 ]; then
-            customerHostname=$(jq -r ".registration.customerHostname" ${TMP})
-            customerSubdomain=$(echo "$customerHostname" | cut -d '.' -f1)
-            # echo DRS $drsVersion detected, found customerSubdomain: $customerSubdomain in $customerHostname
-        fi
-    fi
-fi
-
-if test -n "$customerSubdomain"; then
-    mtlsCustomerDomain=api.$customerSubdomain-m.$ciDomain
-    mtlsCustomerUrl=https://$mtlsCustomerDomain/ims/v1/identities
-
-    elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert $notaryKey --key $notaryCert $mtlsCustomerUrl > $TMP) 2>&1`
     response=`cat $TMP`
-    case $response in
-        *200)
-            echoIfNotHealthcheck "good response from CI-mTLS $mtlsCustomerUrl in $elapsed seconds"
-            ;;
-        *)
-            echo "warning: bad response from CI-mTLS $mtlsCustomerUrl - got $response in $elapsed seconds"
-            if test $verbose == true; then
-                with-proxy curl -v --max-time 5 --cert $notaryKey --key $notaryCert $mtlsCustomerUrl
-            fi
-            ;;
+    expectedResponse="OK"
+    if ! test "$response" = "$expectedResponse"; then
+        echo warning: bad response from Fleet $pingUrl - expected $expectedResponse but got $response in $elapsed seconds
+        if test $verbose == true; then
+            with-proxy curl -v --max-time 5 \
+            --key /opt/bluecat/apt/etc/certs/managementKey.pem \
+            --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
+            --cacert $cacert $pingUrl
+        fi
+    else
+        echoIfNotHealthcheck good response from Fleet $pingUrl in $elapsed seconds
+    fi
+}
+
+checkNotaryReachability() {
+    # TODO: we can delete this after all customers update to > 4.6.0
+    case $spVersion in
+    v4.4*|v4.5*)
+        # old SP versions do not use Notary, so do not test those endpoints
+        return
+        ;;
     esac
-fi
 
-$sudoCmd rm -rf $notaryCert $notaryKey
+    vertexUrl=https://vertex.$vertexEnv.$rootDomain
+    mtlsVertexUrl=https://vertex-m.$vertexEnv.$rootDomain
 
-if test -z "$customerRegion"; then
-    case $fleetEnv in
-    eu*)
-        customerRegion=eu-central-1
+    testUrl=$vertexUrl/v1/jwks
+    elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" $testUrl > $TMP) 2>&1`
+
+    response=`cat $TMP`
+    expectedResponse="200"
+    case $response in
+    *200)
+        echoIfNotHealthcheck good response from Notary-TLS $testUrl in $elapsed seconds
         ;;
     *)
-        customerRegion=us-west-2
+        echo warning: bad response from Notary-TLS $testUrl - expected $expectedResponse but got $response in $elapsed seconds
+        if test $verbose == true; then
+            with-proxy curl -v --max-time 5 $testUrl
+        fi
         ;;
     esac
-fi
 
-if test -n "$customerRegion"; then
-    testURL=https://firehose.$customerRegion.amazonaws.com
+    notaryBundle=/home/egw/bundle.pem
 
-    elapsed=`time (with-proxy curl -s --max-time 5 $testURL > $TMP) 2>&1`
+    if ! test -f $notaryBundle; then
+        echo error: cannot test mTLS endpoints without $notaryBundle
+        return
+    fi
+
+    notaryCert=xx00
+    notaryKey=xx01
+    $sudoCmd rm -rf $notaryCert $notaryKey
+    $sudoCmd csplit --silent $notaryBundle '/-----BEGIN CERTIFICATE-----/'
+
+    testUrl=$mtlsVertexUrl/v1/jwt
+    elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert $notaryKey --key $notaryCert $testUrl > $TMP) 2>&1`
+
     response=`cat $TMP`
+    expectedResponse="200"
     case $response in
-        healthy)
-            echoIfNotHealthcheck "good response from Firehose $testURL in $elapsed seconds"
+    *200)
+        echoIfNotHealthcheck good response from Notary-mTLS $testUrl in $elapsed seconds
+        ;;
+    *)
+        echo warning: bad response from Notary-mTLS $testUrl - expected $expectedResponse but got $response in $elapsed seconds
+        if test $verbose == true; then
+            with-proxy curl -v --max-time 5 --cert $notaryKey --key $notaryCert $testUrl
+        fi
+        ;;
+    esac
+}
+
+checkCIReachability() {
+    if test -z "$customerSubdomain"; then
+        # try to derive CI domain from DRS-3.11 diagnostics
+        exposedIP=`head -1 /opt/bluecat/bsld/conf/node_ips`
+        curl -s -m 60 --noproxy $exposedIP http://${exposedIP}:2021/v2/diagnostics 2>/dev/null > $TMP
+
+        if test -s $TMP; then
+            drsVersion=$(jq -r ".currentVersion" ${TMP})
+            major=$(echo $drsVersion | cut -d '.' -f1)
+            minor=$(echo $drsVersion | cut -d '.' -f2)
+
+            if [ $major -gt 3 ] | [ $minor -ge 11 ]; then
+                customerHostname=$(jq -r ".registration.customerHostname" ${TMP})
+                customerSubdomain=$(echo "$customerHostname" | cut -d '.' -f1)
+                # echo DRS $drsVersion detected, found customerSubdomain: $customerSubdomain in $customerHostname
+            fi
+        fi
+    fi
+
+    if test -n "$customerSubdomain"; then
+        mtlsCustomerDomain=api.$customerSubdomain-m.$ciDomain
+        mtlsCustomerUrl=https://$mtlsCustomerDomain/ims/v1/identities
+
+        elapsed=`time (with-proxy curl -s --max-time 5 -w "%{http_code}" --cert $notaryKey --key $notaryCert $mtlsCustomerUrl > $TMP) 2>&1`
+        response=`cat $TMP`
+        case $response in
+            *200)
+                echoIfNotHealthcheck "good response from CI-mTLS $mtlsCustomerUrl in $elapsed seconds"
+                ;;
+            *)
+                echo "warning: bad response from CI-mTLS $mtlsCustomerUrl - got $response in $elapsed seconds"
+                if test $verbose == true; then
+                    with-proxy curl -v --max-time 5 --cert $notaryKey --key $notaryCert $mtlsCustomerUrl
+                fi
+                ;;
+        esac
+    fi
+
+    $sudoCmd rm -rf $notaryCert $notaryKey
+}
+
+checkFirehoseReachability() {
+    if test -z "$customerRegion"; then
+        case $fleetEnv in
+        eu*)
+            customerRegion=eu-central-1
             ;;
         *)
-            echo "warning: bad response from Firehose $testURL- got $response in $elapsed seconds"
-            if test $verbose == true; then
-                with-proxy curl -v --max-time 5 $testURL
-            fi
+            customerRegion=us-west-2
             ;;
-    esac
-fi
-
-URL=https://service-layer.$fleetEnv.fleet.bluec.at/packages/pool/main/d/docker-ce
-PKG=docker-ce-cli_5%3a24.0.7-1~debian.11~bullseye_amd64.deb
-URL_ENCODED=$URL/$(echo $PKG | tr -d '\n' | jq -sRr @uri)
-
-elapsed=`time (with-proxy curl -s --max-time 15  \
-    --key /opt/bluecat/apt/etc/certs/managementKey.pem \
-    --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
-    --cacert $cacert $URL_ENCODED > $TMP) 2>&1`
-
-if [ $? = 28 ]; then
-    echo warning: timed out downloading speed test file from $URL_ENCODED
-    rm -f $TMP
-    exit 0
-fi
-
-fileSize=`du -sk $TMP | awk '{print $1}'`
-
-if test $fileSize -lt 1000; then
-    echo warning: failed to download speed test file from $URL_ENCODED
-    if test $healthcheck = false; then
-        head -5 $TMP
+        esac
     fi
-    rm -f $TMP
-fi
 
-speedKB=$( awk "BEGIN { print int($fileSize/$elapsed)}" )
-speedMB=$( awk "BEGIN { print $speedKB/1024 }" )
-speedMBint=$( awk "BEGIN { print int($speedMB)}" )
+    if test -n "$customerRegion"; then
+        testURL=https://firehose.$customerRegion.amazonaws.com
 
-# echo elapsed: $elapsed seconds
-# echo fileSize: $fileSize KB
-# echo speed: $speedKB KB / sec
+        elapsed=`time (with-proxy curl -s --max-time 5 $testURL > $TMP) 2>&1`
+        response=`cat $TMP`
+        case $response in
+            healthy)
+                echoIfNotHealthcheck "good response from Firehose $testURL in $elapsed seconds"
+                ;;
+            *)
+                echo "warning: bad response from Firehose $testURL- got $response in $elapsed seconds"
+                if test $verbose == true; then
+                    with-proxy curl -v --max-time 5 $testURL
+                fi
+                ;;
+        esac
+    fi
+}
 
-if test $speedMBint = 0; then
-    echo warning: failed to download speed test file from $URL_ENCODED
-elif test $speedMBint -lt 10; then
-    echo warning: download speed of $speedMBint MB/second is too low and might result in unreliable behaviour
-elif test $speedMBint -lt 20; then
-    echoIfNotHealthcheck acceptable download speed of $speedMBint MB/second
-else
-    echoIfNotHealthcheck good download speed of $speedMBint MB/second
-fi
+checkNetworkBandwidth() {
+    URL=https://service-layer.$fleetEnv.fleet.bluec.at/packages/pool/main/d/docker-ce
+    PKG=docker-ce-cli_5%3a24.0.7-1~debian.11~bullseye_amd64.deb
+    URL_ENCODED=$URL/$(echo $PKG | tr -d '\n' | jq -sRr @uri)
 
+    elapsed=`time (with-proxy curl -s --max-time 15  \
+        --key /opt/bluecat/apt/etc/certs/managementKey.pem \
+        --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
+        --cacert $cacert $URL_ENCODED > $TMP) 2>&1`
+
+    if [ $? = 28 ]; then
+        echo warning: timed out downloading speed test file from $URL_ENCODED
+        rm -f $TMP
+        return
+    fi
+
+    fileSize=`du -sk $TMP | awk '{print $1}'`
+
+    if test $fileSize -lt 1000; then
+        echo warning: failed to download speed test file from $URL_ENCODED
+        if test $healthcheck = false; then
+            head -5 $TMP
+        fi
+        rm -f $TMP
+    fi
+
+    speedKB=$( awk "BEGIN { print int($fileSize/$elapsed)}" )
+    speedMB=$( awk "BEGIN { print $speedKB/1024 }" )
+    speedMBint=$( awk "BEGIN { print int($speedMB)}" )
+
+    # echo elapsed: $elapsed seconds
+    # echo fileSize: $fileSize KB
+    # echo speed: $speedKB KB / sec
+
+    if test $speedMBint = 0; then
+        echo warning: failed to download speed test file from $URL_ENCODED
+    elif test $speedMBint -lt 10; then
+        echo warning: download speed of $speedMBint MB/second is too low and might result in unreliable behaviour
+    elif test $speedMBint -lt 20; then
+        echoIfNotHealthcheck acceptable download speed of $speedMBint MB/second
+    else
+        echoIfNotHealthcheck good download speed of $speedMBint MB/second
+    fi
+}
+
+checkFleetReachability
+checkNotaryReachability
+checkCIReachability
+checkFirehoseReachability
+checkNetworkBandwidth
 rm -f $TMP
 #!/bin/bash -u
 # sh options:
@@ -550,6 +684,11 @@ rm -f $TMP
 # -u  Treat unset variables as an error when substituting
 #
 # warnings - warn about potential problems on an Edge Service Point
+#
+# Changes
+# 4.6.2: warnings script was introduced
+# 4.7.0: BSL-3124 move customer-metrics check from problems to warnings script
+# 4.7.1: BSL-3352 warnings should not run checkNetworkInterfaces on BlueCat Gen5 appliances
 
 export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
 TMP=/tmp/warnings.$USER.$$
@@ -626,7 +765,7 @@ checkCustomerMetrics() {
     curl -s http://localhost:8083/api/v1/metrics > $TMP
     lines=`wc -l $TMP | awk '{print $1}'`
     if test $lines -lt 200; then
-        echo "warning: Fleet SP telemetry-api service is not healthy"
+        echo "warning: Fleet SP customer-metrics service is not healthy"
     fi
 }
 
@@ -636,7 +775,7 @@ checkCerts
 checkCustomerMetrics
 
 case `fleet platform` in
-bdds*)
+BlueCat-*|bdds*)
 	;;
 *)
 	checkNetworkInterfaces
@@ -649,7 +788,8 @@ if test $healthcheck = true; then
     reachability --healthcheck
 fi
 
-case `fleet version` in
+# TODO: we can delete this after all customers update to > 4.6.0
+case $spVersion in
 v4.7*|v4.6.2)
     exit 0
     ;;

@@ -1,8 +1,8 @@
 #!/bin/bash
-# 
+#
 # hotfix cert-renew
 # hotfix to download and activate DRS certificates
-# 
+#
 # usage: ssh [SSH_ARGS] <service-point> sudo /opt/bluecat/bin/hotfix cert-renew
 
 set -euo pipefail
@@ -45,7 +45,7 @@ fi
 
 STATUS_IP=`docker inspect "$(docker ps -qf 'name=status')" | jq -r ".[0].NetworkSettings.Networks.bridge.IPAddress"`
 INSTANCE_ID=`curl -sS -f "$STATUS_IP:2021/v2/diagnostics" | jq -r ".applicationId"`
-logToAnsible "DRS ID: $INSTANCE_ID" 
+logToAnsible "DRS ID: $INSTANCE_ID"
 
 CLIENT_CERT=`curl -sS -f -x http://169.254.1.1:8700 "$CI_API_URL/ccm/v1/spCertificate/client"`
 CA=`curl -sS -f -x http://169.254.1.1:8700 "$CI_API_URL/ccm/v1/spCertificate/ca"`
@@ -95,11 +95,11 @@ while true; do
     NEW_CERT_EXPIRE=`curl -sS "$SPC_IP:2121/v2/diagnostics" | jq -r '.resources[] | select(.id == "certificates") | .info[] | select(.name=="clientCertificateExpiration") | .value'`
     NEW_CA_EXPIRE=`curl -sS "$SPC_IP:2121/v2/diagnostics" | jq -r '.resources[] | select(.id == "certificates") | .info[] | select(.name=="caCertificateExpiration") | .value'`
 
-    if ((NEW_CERT_EXPIRE > CERT_EXPIRE)) && ((NEW_CA_EXPIRE > $CA_EXPIRE)); then 
+    if ((NEW_CERT_EXPIRE > CERT_EXPIRE)) && ((NEW_CA_EXPIRE > $CA_EXPIRE)); then
         logToAnsible "Updated certificates are in use with new expiry times (client: $(date -d @$((NEW_CERT_EXPIRE / 1000))), ca: $(date -d @$((NEW_CA_EXPIRE / 1000))))"
         break
     fi
-    
+
     logToAnsible "Old certificates are still in use (client: $(date -d @$((NEW_CERT_EXPIRE / 1000))), ca: $(date -d @$((NEW_CA_EXPIRE / 1000)))))"
     attempts=$((attempts+1))
     sleep 5

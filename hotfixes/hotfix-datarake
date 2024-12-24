@@ -1,0 +1,1746 @@
+#!/bin/bash
+# Copyright 2020 BlueCat Networks (USA) Inc. and its affiliates. All Rights Reserved.
+#
+# BlueCat Networks
+# Name:    datarake.sh
+# Purpose: Diagnostic report generator for BlueCat DNS Integrity and Edge Service Points
+#
+# most useful command-line flags for SPv4 are: -a -t
+#
+# Fleet Changes
+# 4.5.0: increased curl timeout on fetching telemetry diagnostics
+# 4.6.0: capture /var/log/journal, /home/updateScripts, docker system & stats
+# 4.6.1: adds -t (tiny) option, which omits capturing /var/log/journal and large logs, also collects DRS configuration and /opt/bluecat/*/etc
+# 4.6.2: collects /home/egw /opt/bluecat/etc and fleet-nomad-allocs.txt
+# 4.7.0: collects output of 'hotfix sp-info', curl timout=60s for DRS diagnostics, biosdevname on bdds
+# 4.7.1: do not collect nomad allocations for '-t', support BlueCat Gen5 models
+# 4.7.2: EDG-15044 - Include DRS snapshots in datarake
+
+VERSION=4.7.1
+currentUser=`whoami`
+
+if ! test "$currentUser" = root; then
+        echo You must be root to run datarake
+        exit 1
+fi
+
+printhelp()
+{
+			cat <<HELPMESSAGE
+USAGE: $0 [OPTIONS]
+Generate product diagnostic report to be sent to BlueCat Networks
+
+VERSION : ${VERSION}
+
+OPTIONS:
+  -h   help message.
+  -l   only collect log files and checksums.
+  -a   all, collect additional details on Edge SPv4
+  -t   tiny, omits capturing /var/log/journal and large logs on Edge SPv4
+  -d   collect heap dump (BAM only)
+  -m   compute MD5 checksums of select files
+  -p   capture the contents of the /proc filesystem (optional, potentially long-running)
+  -x   run an extended report focused on the BAM DB (optional, potentially long-running)
+  -z   run BAM DB analyze and collect stats. Very long-running, and potentially intrusive. Use only in cases of very specific need.
+  Note: Options [lsja] are mutually exclusive
+  When no parameters are inputted, collect all data that could be needed for investigation.
+
+HELPMESSAGE
+}
+
+# just in case the file is not transferred properly
+od -c $0 | grep -q '\\r' && echo "Please rerun $0 to generate the diagnostic report." && dos2unix $0 && exit 1
+
+EXTEND=yes
+
+while getopts ":h" opt; do
+	case $opt in
+		h)
+			# if you change the help message, make sure that you change it everywhere
+			printhelp
+			exit 0
+			;;
+	esac
+done
+
+# reset opt index so we can call getopts again
+OPTIND=0
+
+# check which BlueCat Networks product we are investigating
+checkproduct()
+{
+	if [ -e /etc/bcn/product ]; then
+		cat /etc/bcn/product
+	elif [ -e /usr/local/bluecat/ai_post_install.sh ]; then
+		echo "AI"
+	elif [ -e /opt/bluecat/etc/sdp.conf ]; then
+		echo "FLEET"
+		if [ ! -e /usr/local/bluecat ]; then
+			# make sure /usr/local/bluecat exists to avoid confusing error messages elsewhere in this script
+			mkdir /usr/local/bluecat
+		fi
+	fi
+}
+
+PRODUCT=`checkproduct`
+
+# check the product version
+if [ -e /etc/bcn/product.version ]; then
+	PRODUCTVER=`cat /etc/bcn/product.version`
+elif [ -e /opt/bluecat/etc/sdp.conf ]; then
+	PRODUCTVER=`/opt/bluecat/bin/fleet version`
+else
+	PRODUCTVER="UNKNOWN"
+fi
+
+# terminate if we have no idea what product we are dealing with here.
+if [ "${PRODUCT}X" == "X" ]; then
+	echo "ERROR: Unsupported product, please contact BlueCat Networks Client Care team for further instructions."
+	exit 1
+fi
+
+DATESTART=`date +%Y%m%d_%H%M%S`
+HOST=`hostname -s`
+TMPLOGHOME=/tmp/datarake
+TARBALLTOPDIR=bcn-support\.${HOST}\.${PRODUCT}\.${PRODUCTVER}\.${DATESTART}
+TARBALL=/tmp/bcn-support.${HOST}.${PRODUCT}.${PRODUCTVER}.${DATESTART}.tgz
+JAVADIAGJAR=/usr/local/bluecat/ProteusDiagnostics.jar
+HEAPDUMPDIR=/var/tmp
+HEAPDUMPFILENAME=heap.hprof
+NICENESS="ionice -c 2 -n 6 nice"
+tar_excludes="--exclude /var/log/jetty --exclude /var/log/jetty9 --exclude /var/state/dhcp"
+BIG_FILES=/tmp/large_files_to_exclude
+PREVIOUS_DATARAKES=/tmp/previous_datarakes_to_exclude
+
+mkdir -p ${TMPLOGHOME}
+
+# list of files needed for investigation for -s or no parameters
+fileList=(	`find /etc -name "*.conf"` \   # add all the *.conf files from under /etc
+`find /usr/local/bluecat -name ".*disable"` \    # include all the disable flags
+`find / -type f -name ".*_history"`  \    # command history files
+/.lcd \
+/boot/grub \
+/etc/apt \
+/etc/bcn/ \
+/etc/crontab \
+/etc/cron.* \
+/etc/fstab \
+/etc/hosts \
+/etc/hostname \
+/etc/logrotate.conf \
+/etc/logrotate.d \
+/etc/network \
+/etc/ntp \
+/etc/profile.d \
+/etc/resolv.conf \
+/etc/snmp \
+/etc/syslog.conf \
+/etc/syslog-ng \
+/var/lib/syslog-ng/patterndb.xml \
+/usr/local/cli/cli.db \
+/var/run \
+/var/log/ \
+/${HEAPDUMPDIR}/${HEAPDUMPFILENAME} \
+/var/patchinfo \
+/var/patch/patchDb.csv \
+~/.bash_history \
+${TMPLOGHOME} \
+/home/bluecat/preserved_scripts \
+/var/lib/ntp/drift \
+/var/spool/cron/crontabs
+)
+
+# list of files needed for investigation for -a or -j parameters
+fileListSecureOnly=( \
+/etc/ssh \
+/etc/sudoers \
+/etc/hosts.allow \
+/etc/hosts.deny \
+
+)
+
+# list of files needed for investigation for -l parameter
+fileListLogOnly=(
+/var/log/ \
+/root/heap.prof \
+${TMPLOGHOME}/datarake.log \
+
+)
+
+# for use by adonisListReplicated and adonisListReplicatedSub
+adonisList=(
+/etc/dhcpd.conf \
+/etc/rndc.conf \
+/etc/service-type.key \
+/usr/local/bluecat/Build.properties \
+/usr/local/bluecat/proteus-notify.properties \
+/usr/local/bluecat/server.id \
+/usr/local/bluecat/server.properties \
+/usr/local/bluecat/subnet.csv \
+/usr/local/bluecat/version.dat \
+/var/state/dhcp/dhcpd.leases \
+/var/lib/logrotate/status \
+/var/state/dhcp \
+/var/bluecat/deploy \
+/etc/ha.d/ \
+/usr/local/bluecat/postDeploy.sh \
+/usr/local/bluecat/indigoKitten.dat \
+/validation* \
+)
+
+# for -a or -s parameters
+adonisListReplicated=(
+/replicated \
+)
+
+# for -j or no parameters
+adonisListReplicatedSub=(
+/replicated/etc \
+/replicated/lost+found \
+/replicated/tftpboot \
+/replicated/usr \
+/replicated/var \
+)
+
+# for -l parameter
+adonisListLogOnly=()
+
+# for -l parameter
+proteusListLogOnly=(
+/data/migration/log/ \
+/opt/server/proteus/log/ \
+/opt/server/proteus/logs/ \
+)
+
+# for -j or -a or -s or no parameters
+proteusList=(
+/etc/pgsql/conf \
+/etc/postgresql \
+/etc/postgresql-common \
+/data/migration/log/ \
+/data/pgdata/pg_hba.conf \
+/data/pgdata/pg_ident.conf \
+/data/pgdata/replication.conf \
+/data/pgdata/postgresql.auto.conf \
+/data/pgdata/postgresql.conf \
+/data/pgdata/auto.conf \
+/data/pgdata/override.conf \
+/data/pgdata/postmaster.opts \
+/data/pgdata/postmaster.pid \
+/data/pgdata/standby.signal \
+/data/pgdata/server.crt \
+/data/pgdata/server.key \
+/data/deployment \
+/opt/server/proteus/start.ini \
+/opt/server/proteus/etc/ \
+/opt/server/proteus/log/ \
+/opt/server/proteus/logs/ \
+/data/slony/ \
+/etc/replication.conf \
+/home/replication/.ssh \
+/usr/local/bluecat/server.properties \
+/root/heap.prof \
+/data/rrdtool/data \
+/data/notify/incoming \
+$(ls -1rt /data/discovery/ 2>/dev/null | head | sed -e 's#^#/data/discovery/#g') \
+$(ls -1t /data/discovery/ 2>/dev/null | head | sed -e 's#^#/data/discovery/#g') \
+)
+
+# list of files needed for investigation for -a or -j parameters
+fleetList=( \
+/etc \
+/usr/local/etc \
+/usr/local/share \
+/usr/local/sbin \
+/home/egw \
+/home/vagrant \
+/home/sdp/logs \
+/home/sdp/nomad/alloc \
+/home/sdp/systemd/system \
+/home/updateScripts/update* \
+/opt/bluecat/etc \
+/opt/bluecat/*/etc
+)
+
+adonistaroption="--exclude=/replicated/jail/named/dev/* --exclude=/replicated/jail/named/opt/nfast/sockets --ignore-failed-read"
+bcntaroption="--ignore-failed-read"
+fleettaroption="--exclude=/etc/alternatives --ignore-failed-read"
+
+# Generate command outputs for investigation for -l parameter
+commonInfoBasic()
+{
+	# Date and time
+	date > ${TMPLOGHOME}/date.txt
+
+	printf "Collecting extended date/time information ...\n"
+	printf "\n system: " >> ${TMPLOGHOME}/date.txt
+	date "+%Y-%m-%d %H:%M:%S.%N" >> ${TMPLOGHOME}/date.txt 2>&1
+	printf "hwclock: " >> ${TMPLOGHOME}/date.txt
+	hwclock -r >> ${TMPLOGHOME}/date.txt 2>&1
+
+	# Version of this script
+	echo $VERSION > ${TMPLOGHOME}/datarake-version.txt
+
+	# include a copy of the datarake
+	cp -f $0 ${TMPLOGHOME}/
+
+    # sha512 checksum of script (faster than 256)
+    ( cd ${TMPLOGHOME} ; sha512sum $(basename $0) > ${TMPLOGHOME}/datarake.sha512 )
+}
+
+# Generate command outputs for investigation for -j or -a or -s or no parameters
+commonInfoAdditional()
+{
+	commonInfoBasic
+
+	echo "Disk information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	df -h > ${TMPLOGHOME}/df-h.txt 2>&1        # Disk usage
+	mount | sort > ${TMPLOGHOME}/mount.txt 2>&1
+	fdisk -l > ${TMPLOGHOME}/fdisk.txt 2>&1
+	lsblk  > ${TMPLOGHOME}/lsblk.txt 2>&1
+	lspci -vvv  > ${TMPLOGHOME}/lspci-vvv.txt 2>&1      # display information about all pci devices
+	ethtool -S eth0  > ${TMPLOGHOME}/ethtool-S_eth0.txt 2>&1 # statistics
+	lsmod > ${TMPLOGHOME}/lsmod.txt 2>&1
+
+	# generates the ethtool output for each interface
+	local links=( `ip -o link | awk '{print $2}' | egrep -v 'veth|dsr|sdp' | sed -e "s/://"` )
+	for link in ${links[@]}; do ethtool $link; echo; done > ${TMPLOGHOME}/ethtool.txt
+
+	# System version
+	echo "System version information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	dpkg -l > ${TMPLOGHOME}/dpkg-l.txt 2>&1
+	apt-cache stats > ${TMPLOGHOME}/apt-cache_stats.txt 2>&1
+	dmesg -T > ${TMPLOGHOME}/dmesg.txt 2>&1
+	uname -a > ${TMPLOGHOME}/uname.txt 2>&1
+
+	# Firewall status
+	echo "Firewall ..."  | tee -a ${TMPLOGHOME}/datarake.log
+
+	# Only run -t nat if conntrack is already active, otherwise it will start tracking connections
+	# and could cause performance issues
+	[ -f "/proc/net/nf_conntrack" ] && CONNTRACK_ACTIVE=$(head -1 /proc/net/nf_conntrack)
+	if [ ! -z "${CONNTRACK_ACTIVE}" ]; then
+		iptables -nL -t nat > ${TMPLOGHOME}/iptables-nL-tnat.txt 2>&1
+	else
+		echo "Skipped running 'iptables -t nat' to avoid activating conntrack" > ${TMPLOGHOME}/iptables-nL-tnat.txt 2>&1
+	fi
+
+	# Network connection status
+	echo "Netstat status ..."  | tee -a ${TMPLOGHOME}/datarake.log
+	netstat -in > ${TMPLOGHOME}/netstat-in.txt 2>&1
+	netstat -rn > ${TMPLOGHOME}/netstat-rn.txt 2>&1
+	netstat -an > ${TMPLOGHOME}/netstat-an.txt 2>&1
+	netstat -tuplan > ${TMPLOGHOME}/netstat-tulpan.txt 2>&1
+
+	# Routing information
+	echo "Routing information ..."  | tee -a ${TMPLOGHOME}/datarake.log
+	ip a > ${TMPLOGHOME}/ip-a.txt 2>&1
+	ip r > ${TMPLOGHOME}/ip-r.txt 2>&1
+
+	# Virtual memory statistics
+	echo "Virtual memory information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	vmstat > ${TMPLOGHOME}/vmstat.txt 2>&1
+
+	# Current process status
+	echo "Process information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	ps auxfw > ${TMPLOGHOME}/ps_auxw.txt 2>&1
+	ps -eLf > ${TMPLOGHOME}/ps_eLf.txt 2>&1
+	top -b -n 1 > ${TMPLOGHOME}/top-b-n_1.txt 2>&1
+
+	# Kernel runtime parameters
+	echo "Sysctl information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	sysctl -a > ${TMPLOGHOME}/sysctl-a.txt 2>&1
+
+	# grub information
+	echo "Grub version ..." | tee -a ${TMPLOGHOME}/datarake.log
+	grub-install --version > ${TMPLOGHOME}/grub-version.txt 2>&1
+
+	# env information
+	echo "ENV variables ..." | tee -a ${TMPLOGHOME}/datarake.log
+	env | sort > ${TMPLOGHOME}/env.txt 2>&1
+
+	# bash history, with the history command
+	echo "Bash history with history ..." | tee -a ${TMPLOGHOME}/datarake.log
+	if [ -e /etc/init.d/bluecatEnvironment ]; then
+		grep -q "^PROMPT_COMMAND=" /etc/init.d/bluecatEnvironment > /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			echo -e "\nshopt -s histappend\nPROMPT_COMMAND=\"history -a;\$PROMPT_COMMAND\"\n" >> /etc/init.d/bluecatEnvironment
+		fi
+	elif [ -e /etc/profile.d/system_environment.sh ]; then
+		grep -q "^PROMPT_COMMAND=" /etc/profile.d/system_environment.sh > /dev/null 2>&1
+		if [ $? -ne 0 ]; then
+			echo -e "\nshopt -s histappend\nPROMPT_COMMAND=\"history -a;\$PROMPT_COMMAND\"\n" >> /etc/profile.d/system_environment.sh
+		fi
+	fi
+
+	HISTFILE=/root/.bash_history
+    HISTSIZE=500
+    HISTTIMEFORMAT="%F %T  "
+	set -o history
+	history ${HISTSIZE} > ${TMPLOGHOME}/bash_history.txt 2>&1
+
+	# lsof output
+	echo "List of opened files lsof ..." | tee -a ${TMPLOGHOME}/datarake.log
+	lsof -n > ${TMPLOGHOME}/lsof-n.txt 2>&1
+
+	# patch information
+	echo "Patch rollback information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	test -e /var/patch && find /var/patch -type f -exec $md5sum {} \; > ${TMPLOGHOME}/var_patch_md5.txt 2>&1
+
+	# ntpd information
+	echo "NTP information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	ps -C ntpd &> /dev/null && ( echo "ntpq -p" ; ntpq -p ; echo ; echo "ntpq -c sysinfo -c sysstats" ; ntpq -c sysinfo -c sysstats ) > ${TMPLOGHOME}/ntpd.txt 2>&1
+
+	cat /proc/cpuinfo > ${TMPLOGHOME}/proc_cpuinfo.txt
+	cat /proc/meminfo > ${TMPLOGHOME}/proc_meminfo.txt
+	cat /proc/swaps > ${TMPLOGHOME}/proc_swaps.txt
+	cat /proc/diskstats > ${TMPLOGHOME}/proc_diskstats.txt
+
+	# CPU core usage information
+	mpstat -P ALL 2 5 > ${TMPLOGHOME}/mpstat_cpu_core_usage.txt
+
+	# Search for non-standard cronjobs that the customer may have installed.
+    find_custom_cronjobs > ${TMPLOGHOME}/custom_cronjobs.txt 2>&1
+    systemstats # Output is written to files directly
+
+    dmidecode > ${TMPLOGHOME}/dmidecode.txt 2>&1
+    test -f /usr/bin/lscpu && /usr/bin/lscpu > ${TMPLOGHOME}/lscpu.txt 2>&1
+
+    if [ ! "$PRODUCT" = "FLEET" ]; then
+        echo "Collecting PsmClient information ..."
+        psmclient_extended > ${TMPLOGHOME}/psmclient_extended.txt 2>&1
+        /usr/sbin/adonis-servtype /etc/service-type.key > ${TMPLOGHOME}/adonis-servtype.txt 2>&1
+    fi
+
+    # List hardware (XML format)
+    [[ -f /usr/bin/lshw ]] && /usr/bin/lshw -xml > ${TMPLOGHOME}/lshw.xml 2>&1
+}
+
+# gather the Adonis specific information for -l parameter
+adonisInfoBasic()
+{
+
+
+	# checksum of crucial files
+	echo "Generating checksum information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	local adonisfileList="/usr/local/bluecat/lib/*"
+	${NICENESS} $md5sum ${adonisfileList} > ${TMPLOGHOME}/md5.txt 2>&1
+	ls -al ${adonisfileList} > ${TMPLOGHOME}/ls-al.txt 2>&1
+
+
+}
+
+# gather the Adonis specific information for -j or -a or -s or no parameters
+adonisInfoAdditional()
+{
+	# Firewall status
+	echo "Firewall ..." | tee -a ${TMPLOGHOME}/datarake.log
+	iptables -nL > ${TMPLOGHOME}/iptables-nL.txt 2>&1
+    iptables-save > ${TMPLOGHOME}/iptables-save.txt 2>&1
+    ip6tables-save > ${TMPLOGHOME}/ip6tables-save.txt 2>&1
+    [[ -f /usr/local/bluecat/custom_fw_rules ]] && /usr/local/bluecat/custom_fw_rules --export-rules ${TMPLOGHOME}/custom_fw_rules.txt || true
+    [[ -f /proc/net/nf_conntrack ]] && cat /proc/net/nf_conntrack > ${TMPLOGHOME}/nf_conntrack.txt 2>&1
+
+	# Named status
+	echo "Rndc output ..." | tee -a ${TMPLOGHOME}/datarake.log
+    echo "... stats"
+    rndc stats    2>&1 && mv -f ${JAIL}/named/var/dns-config/dbs/named.stats    ${TMPLOGHOME}/rndc_stats.txt    2>&1
+    echo "... secroots"
+    rndc secroots 2>&1 && mv -f ${JAIL}/named/var/dns-config/dbs/named.secroots ${TMPLOGHOME}/rndc_secroots.log 2>&1
+    echo "... status"
+    rndc status > ${TMPLOGHOME}/rndc_status.txt 2>&1
+
+    # Named cache database & statistics
+    echo "Named cache and statistics ..." | tee -a ${TMPLOGHOME}/datarake.log
+    rndc dumpdb -all 2>&1 && mv -f ${JAIL}/named/var/dns-config/dbs/named_dump.db ${TMPLOGHOME}/rndc_dumpdb.txt 2>&1
+    echo "... recursing"
+    rndc recursing 2>&1 && mv -f ${JAIL}/named/var/dns-config/dbs/named.recursing ${TMPLOGHOME}/rndc_recursing.txt 2>&1
+
+    # Only perform grab of BIND statistics if port 8053 is open
+    lsof -nP -i :8053 > /dev/null 2>&1 && \
+		wget 127.0.0.1:8053 -O - -o ${TMPLOGHOME}/named_statistics.txt 2>&1 | xmllint --format - > ${TMPLOGHOME}/named_statistics.xml
+	# Additional version information
+	echo "Adonis packages checksum information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	test -e /var/lib/dpkg/info/adonis-app.md5sums && cd /;  ${NICENESS} $md5sum -c /var/lib/dpkg/info/*.md5sums &> ${TMPLOGHOME}/adonis-debs-md5.txt 2>&1
+	grep -q -e "FAILED$" ${TMPLOGHOME}/adonis-debs-md5.txt  && ${NICENESS} $md5sum `grep -e "FAILED$" ${TMPLOGHOME}/adonis-debs-md5.txt | awk 'BEGIN{FS=":"}{print $1}'` &> ${TMPLOGHOME}/adonis-debs-md5-mismatched.txt
+
+	# checksum of crucial files
+	echo "Generating checksum information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	local adonisfileList="/usr/local/bluecat/lib/*"
+	${NICENESS} $md5sum ${adonisfileList} > ${TMPLOGHOME}/md5.txt 2>&1
+	ls -al ${adonisfileList} > ${TMPLOGHOME}/ls-al.txt 2>&1
+
+	# service flags
+	echo "Collecting service information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	find /usr/local/bluecat -name ".*" > ${TMPLOGHOME}/disableServices.txt 2>&1
+
+	# listing of the dir
+	ls -al /var/bluecat/notify/spool/ > ${TMPLOGHOME}/var-bluecat-notify-spool-listing.txt 2>&1
+
+    # sizing of /replicated
+    find /replicated -type d -exec du -sh '{}' \; | sort -rh >> ${TMPLOGHOME}/size-replicated.txt
+
+    # bdds size and number of PNA files/directory
+    printf "Total number of PNA files: " > ${TMPLOGHOME}/size-pna.txt 2>&1
+    ls -1 /replicated/var/bluecat/notify/spool | wc -l >> ${TMPLOGHOME}/size-pna.txt 2>&1
+    echo "---------------------------------------------------------------------------" >> ${TMPLOGHOME}/size-pna.txt 2>&1
+    df -h /replicated/var/bluecat/notify/spool >> ${TMPLOGHOME}/size-pna.txt 2>&1
+    echo "---------------------------------------------------------------------------" >> ${TMPLOGHOME}/size-pna.txt 2>&1
+    du -sh /replicated/var/bluecat/notify/spool >> ${TMPLOGHOME}/size-pna.txt 2>&1
+
+	# ifconfig output
+	ifconfig > ${TMPLOGHOME}/ifconfig.txt 2>&1
+
+	#diagnoseha.sh output
+	echo "Running diagnoseHA.sh" | tee -a ${TMPLOGHOME}/datarake.log
+	diagnoseHA.sh > ${TMPLOGHOME}/HAdiagnosis.txt 2>&1
+
+
+	kill -3 $(pidof java) # JVM (commandServer) thread dump (into /var/log/commandServer.log)
+	xha_prompt
+	grab_pna_samples
+	# Capture DHCP failover information.
+	pidof dhcpd >/dev/null 2>&1 && fomon -t states > ${TMPLOGHOME}/fomon-t-states.txt 2>&1
+	dhcp_failover_peer_prompt
+
+    # get file descriptor info
+    printf "Getting file descriptor info...\n"
+    if [[ $(pidof named) ]]; then
+        ls -l /proc/$(pidof named)/fd | tee ${TMPLOGHOME}/fd_named.txt | wc -l >> ${TMPLOGHOME}/fd_named.txt
+        printf "see fs.file in tmp/datarake/sysctl-a.txt" >> ${TMPLOGHOME}/fd_named.txt
+    fi
+    if [[ $(pidof dhcpd) ]]; then
+        ls -l /proc/$(pidof dhcpd)/fd | tee ${TMPLOGHOME}/fd_dhcpd.txt |  wc -l >> ${TMPLOGHOME}/fd_dhcpd.txt
+        echo "see fs.file in tmp/datarake/sysctl-a.txt" >> ${TMPLOGHOME}/fd_dhcpd.txt
+    fi
+
+    echo "Collecting PsmClient Adonis information ..."
+    psmclient_extended_adonis >> ${TMPLOGHOME}/psmclient_extended.txt 2>&1
+
+    echo "Collecting docker container information ..."
+    docker ps --all > ${TMPLOGHOME}/containers.txt 2>&1
+}
+
+fleetInfoBasic()
+{
+    echo "Collecting Fleet Service Point information ..."
+    cp /opt/bluecat/etc/sdp.conf ${TMPLOGHOME}/fleet-sdp.conf
+    cp /opt/bluecat/bsld/conf/node.conf ${TMPLOGHOME}/fleet-node.conf
+    cp /opt/bluecat/bsld/conf/node_ips ${TMPLOGHOME}/fleet-node_ips
+    cp /opt/bluecat/etc/platform.txt ${TMPLOGHOME}/fleet-platform.txt
+    if test -d /home/updateScripts; then
+        cp -pr /home/updateScripts ${TMPLOGHOME}/fleet-home-updatescripts
+    fi
+    if test -d /home/sdp/logs; then
+        mkdir ${TMPLOGHOME}/fleet-home-sdp-logs
+	cd /home/sdp/logs
+        find . -type f -not -iname '*.tgz' -exec cp --parents {} ${TMPLOGHOME}/fleet-home-sdp-logs/ \;
+	cd - > /dev/null
+    fi
+    egrep 'Notice|Error' /var/log/sdp/admin.log* > ${TMPLOGHOME}/fleet-admin-actions.txt 2>&1
+
+    systemctl list-units > ${TMPLOGHOME}/fleet-system-units.txt 2>&1
+
+    echo "Collecting docker container information ..."
+    docker ps --all > ${TMPLOGHOME}/fleet-docker-containers.txt 2>&1
+    docker images > ${TMPLOGHOME}/fleet-docker-images.txt 2>&1
+    docker stats --all --no-stream > ${TMPLOGHOME}/fleet-docker-stats.txt 2>&1
+    docker system df -v > ${TMPLOGHOME}/fleet-docker-df.txt 2>&1
+    docker system info > ${TMPLOGHOME}/fleet-docker-info.txt 2>&1
+
+    . /home/operations/.bash_aliases
+    echo "Collecting Nomad and Consul information ..."
+    hashi status > ${TMPLOGHOME}/fleet-hashi-status.txt 2>&1
+    nomad operator scheduler get-config > ${TMPLOGHOME}/fleet-nomad-scheduler.txt 2>&1
+
+    local jobs=( `nomad status | grep -v Priority | grep running | awk '{print $1}'` )
+    for job in ${jobs[@]}; do
+	    echo "JOB $job ...." >> ${TMPLOGHOME}/fleet-nomad-jobs.txt
+	    nomad status $job >> ${TMPLOGHOME}/fleet-nomad-jobs.txt 2>&1
+    done
+
+    du -sm /home/sdp/nomad/alloc/*  | sort -nr > ${TMPLOGHOME}/fleet-nomad-alloc-mb.txt 2>&1
+    du -sm /var/lib/sdp/fluentbit/* | sort -nr > ${TMPLOGHOME}/fleet-fluentbit-dbs-mb.txt 2>&1
+
+    consul kv get -recurse > ${TMPLOGHOME}/fleet-consul-kv.txt 2>&1
+    catalog all > ${TMPLOGHOME}/fleet-consul-services.txt 2>&1
+
+    anycast status > ${TMPLOGHOME}/fleet-anycast-status.txt 2>&1
+    anycast diag > ${TMPLOGHOME}/fleet-anycast-diag.txt 2>&1
+    anycast proto > ${TMPLOGHOME}/fleet-anycast-proto.txt 2>&1
+    setproxy --show > ${TMPLOGHOME}/fleet-proxy-status.txt 2>&1
+    cloud-id -j > ${TMPLOGHOME}/fleet-cloud-id.json 2>&1
+    swinfo -v > ${TMPLOGHOME}/fleet-swinfo.txt 2>&1
+    apt list ---upgradable > ${TMPLOGHOME}/fleet-sw-upgradable.txt 2>&1
+    hwinfo > ${TMPLOGHOME}/fleet-hwinfo.txt 2>&1
+    problems -v > ${TMPLOGHOME}/fleet-problems.txt 2>&1
+	reachability > ${TMPLOGHOME}/fleet-reachability.txt 2>&1
+    vgdisplay > ${TMPLOGHOME}/fleet-volumes.txt 2>&1
+    lvs > ${TMPLOGHOME}/fleet-lvs.txt 2>&1
+    fleet resources > ${TMPLOGHOME}/fleet-resources.txt 2>&1
+    fleet info > ${TMPLOGHOME}/fleet-info.txt 2>&1
+    hotfix check > ${TMPLOGHOME}/fleet-hotfix-check.txt 2>&1
+
+    exposedIP=`head -1 /opt/bluecat/bsld/conf/node_ips`
+    curlTimeout=10
+
+    drsDiagnosticsFile="${TMPLOGHOME}/fleet-drs-diagnostics.txt"
+
+    curl -s -m 60 --noproxy $exposedIP http://${exposedIP}:8083/api/v1/diagnostics?full=false | jq > ${TMPLOGHOME}/fleet-diagnostics.txt 2>&1
+    curl -s -m $curlTimeout --noproxy $exposedIP http://${exposedIP}:8083/api/v1/status | jq > ${TMPLOGHOME}/fleet-status.txt 2>&1
+    curl -s -m $curlTimeout --noproxy $exposedIP http://${exposedIP}:8083/api/v1/metrics > ${TMPLOGHOME}/fleet-metrics.txt 2>&1
+    curl -s -m $curlTimeout --noproxy $exposedIP http://${exposedIP}:7030/echo | jq > ${TMPLOGHOME}/fleet-demo-echo.txt 2>&1
+    curl -s -m 60 --noproxy $exposedIP http://${exposedIP}:2021/v2/diagnostics | jq > ${drsDiagnosticsFile} 2>&1
+
+    curl -s -m $curlTimeout --noproxy localhost http://localhost:2020/api/v1/storage | jq > ${TMPLOGHOME}/fleet-fluentbit-storage.txt 2>&1
+    curl -s -m $curlTimeout --noproxy localhost http://localhost:2020/api/v1/metrics | jq > ${TMPLOGHOME}/fleet-fluentbit-metrics.txt 2>&1
+    curl -s -m $curlTimeout --noproxy 169.254.1.1 http://169.254.1.1:8701/metrics > ${TMPLOGHOME}/fleet-egw-metrics.txt 2>&1
+    curl -v -m $curlTimeout --noproxy 169.254.1.1 http://169.254.1.1:8701/status > ${TMPLOGHOME}/fleet-egw-status.txt 2>&1
+
+    openssl x509 -in /home/egw/bundle.pem -text -noout > ${TMPLOGHOME}/fleet-egw-cert.txt 2>&1
+
+    case `fleet platform` in
+    BlueCat-*|bdds*)
+        biosdevname -d > ${TMPLOGHOME}/fleet-biosdevname.txt 2>&1
+        ;;
+    esac
+
+    serviceVolumes=`(cd /svcVols; echo *)`
+    for serviceVolume in $serviceVolumes; do
+        if test -e /svcVols/$serviceVolume/service/dns-gateway-service; then
+            echo Collecting DRS configuration ...
+            serviceDir=/svcVols/$serviceVolume/service
+            drsDatarake=$TMPLOGHOME/drs-$serviceVolume
+            mkdir -p $drsDatarake
+            cp `find $serviceDir/dns-gateway-service/settings $serviceDir/dns-gateway-service/policy -type f | egrep -v 'domainRadixTree|sourceIpLists|responseIPs' | sort` $drsDatarake
+            if test -d $serviceDir/dns-gateway-service/snapshots; then
+                cp -pr $serviceDir/dns-gateway-service/snapshots $drsDatarake/snapshots
+                find $drsDatarake/snapshots -type f | while read file; do
+                    if [[ ! "$file" =~ \.zst$ && ! "$file" =~ \.zstd$ ]]; then
+                        mv "$file" "${file}.zst"
+                    fi
+                done
+            fi
+        fi
+    done
+
+    if [ -s ${drsDiagnosticsFile} ]; then
+        drsVersion=$(jq -r ".currentVersion" ${drsDiagnosticsFile})
+        major=$(echo $drsVersion | cut -d '.' -f1)
+        minor=$(echo $drsVersion | cut -d '.' -f2)
+
+        if [ $major -gt 3 ] | [ $minor -ge 11 ]; then
+            echo "DRS $drsVersion detected, running CI reachability ..."
+            customerHostname=$(jq -r ".registration.customerHostname" ${drsDiagnosticsFile})
+            customerSubdomain=$(echo "$customerHostname" | cut -d '.' -f1)
+            reachability -c ${customerSubdomain} > ${TMPLOGHOME}/ci-reachability.txt 2>&1
+        fi
+    fi
+}
+
+fleetInfoAdditional()
+{
+    fleetInfoBasic
+
+	echo "Collecting Additional Service Point information ..."
+
+    allocations=`nomad operator api /v1/allocations | jq -r '.[].ID'`
+    for alloc in $allocations; do
+        echo "ALLOCATION $alloc ...." >> ${TMPLOGHOME}/fleet-nomad-allocs.txt
+        nomad alloc status $alloc >> ${TMPLOGHOME}/fleet-nomad-allocs.txt 2>&1
+    done
+}
+
+# for -j -a -s or no parameters
+jasnoextractjar()
+{
+	arfile=$1
+
+	echo ${arfile} | grep -q -E "\.?ar$" | tee -a ${TMPLOGHOME}/datarake.log
+	if [ "$?" -eq 0 ]; then
+		local tmpdir=${jarfile}.tmp
+		mkdir -p ${tmpdir}
+		unzip ${arfile} -d ${tmpdir} > /dev/null
+		rm -f ${arfile}
+		mv -f ${tmpdir} ${arfile}
+		local earjarfiles=`find ${arfile} -type f -name "proteus-*.?ar" -o -type f -name "adonis-*.?ar"`
+		for subarfile in ${earjarfiles}
+		do
+			extractjar ${subarfile}
+		done
+	fi
+}
+
+# returns true if we have enough disk space, otherwise false
+checkDiskSpaceForHeapDump()
+{
+    javapid=$1
+
+    typeset -i usedheap availableSpace requiredSpace
+
+    # calculate percentage used      the process virtual size is a safe upper bound on heap size    vsz unit is K
+    usedheap=$(COLUMNS=999 ps -w -w --no-headers -o pid,vsz,args -C java | fgrep -e "/opt/server/proteus" | awk "{ print \$2; }")
+
+    # get available space in KB (1024 bytes)
+    availableSpace=$(df -k --output=avail ${HEAPDUMPDIR} | sed -n 2p)
+
+    # assume we need 1.5 times the current heap size
+    ((requiredSpace=(usedheap*15)/10))
+
+    if [[ ${requiredSpace} -gt ${availableSpace} ]]; then
+        echo "WARNING: not enough space for creating the Java Heap dump. Required: ${requiredSpace} KB in ${HEAPDUMPDIR}, available: ${availableSpace} KB" | tee -a ${TMPLOGHOME}/datarake.log
+        false
+    else
+        true
+    fi
+}
+
+# capture the BAM application heap dump
+captureHeapDump()
+{
+    local javapid=$1
+
+    if [ "${optionGetHeapDump}" != "1" ]; then
+        echo "Warning: skipping heap dump creation. Please use '-d' if you want to capture a heap dump." | tee -a ${TMPLOGHOME}/datarake.log
+        return
+    fi
+
+    if [ ! -e "${JAVADIAGJAR}" ]; then
+		echo "ERROR: missing ${JAVADIAGJAR}. Can't generate heap dump!" | tee -a ${TMPLOGHOME}/datarake.log
+		return
+	fi
+
+	# delete any old heap dump
+	rm -f ${HEAPDUMPDIR}/${HEAPDUMPFILENAME}
+
+    checkDiskSpaceForHeapDump ${javapid}
+    if [[ $? -ne 0 ]]; then
+        return
+    fi
+
+    echo "Generating Java heap dump ..." | tee -a ${TMPLOGHOME}/datarake.log
+    # dumping the heap as heap.hprof under tmp
+    javahprof=${HEAPDUMPDIR}/${HEAPDUMPFILENAME}
+    java -Dcom.bluecat.dumpFileName=${javahprof} -Dcom.bluecat.formatter=CSV -Dcom.bluecat.HeapDump=YES -cp ${JAVADIAGJAR} com/bluecat/diagnostics/Diagnostics >> ${TMPLOGHOME}/datarake.log 2>&1
+    local hdes=$?
+    # On version 8.1, the ProteusDiagnostics.jar does not support the
+    # "com.bluecat.dumpFileName" property. The result of that is that the hprof
+    # file will be dumped to the "/heap.hprof" path. To work around this issue,
+    # we look for "/heap.hprof" and, if it's found, move it to the correct
+    # path.
+    [[ -e /heap.hprof ]] && mv -n /heap.hprof "$javahprof"
+
+    if [ ! -e "${javahprof}" -o "$hdes" -ne 0 ]; then
+        echo "ERROR: failed to generate ${javahprof}" | tee -a ${TMPLOGHOME}/datarake.log
+		return
+    fi
+}
+
+# gather the Proteus specific information for -l parameter
+proteusInfoBasic()
+{
+		# checksum of crucial files
+	echo "Generating checksum information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	local proteusfileList="/opt/server/proteus/webapps/*.war /opt/server/proteus/lib/ext/*"
+	${NICENESS} $md5sum ${proteusfileList} > ${TMPLOGHOME}/md5.txt 2>&1
+	ls -al ${proteusfileList} > ${TMPLOGHOME}/ls-al.txt 2>&1
+
+}
+
+# gather the Proteus specific information for -j or -a or -s or no parameters
+proteusInfoAdditional()
+{
+	# Firewall status
+	echo "Firewall ..." | tee -a ${TMPLOGHOME}/datarake.log
+	iptables -nL > ${TMPLOGHOME}/iptables-nL.txt 2>&1
+    iptables-save > ${TMPLOGHOME}/iptables-save.txt 2>&1
+    ip6tables-save > ${TMPLOGHOME}/ip6tables-save.txt 2>&1
+
+    # Only run -t nat if conntrack is already active, otherwise it will start tracking connections
+	# and could cause performance issues
+	[ -f "/proc/net/nf_conntrack" ] && CONNTRACK_ACTIVE=$(head -1 /proc/net/nf_conntrack)
+	if [ ! -z "${CONNTRACK_ACTIVE}" ]; then
+		iptables -nL -t nat > ${TMPLOGHOME}/iptables-nL-tnat.txt 2>&1
+	else
+		echo "Skipped running 'iptables -t nat' to avoid activating conntrack" > ${TMPLOGHOME}/iptables-nL-tnat.txt 2>&1
+	fi
+
+	# Version information
+	echo "Version information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	/usr/local/bluecat/versions.sh > ${TMPLOGHOME}/versionsh.txt 2>&1
+
+	# Additional version information
+	echo "Proteus packages checksum information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	test -e /var/lib/dpkg/info/proteus-app.md5sums && cd /;  ${NICENESS} $md5sum -c /var/lib/dpkg/info/*.md5sums &> ${TMPLOGHOME}/proteus-debs-md5.txt 2>&1
+	grep -q -e "FAILED$" ${TMPLOGHOME}/proteus-debs-md5.txt && ${NICENESS} $md5sum `grep -e "FAILED$" ${TMPLOGHOME}/proteus-debs-md5.txt | awk 'BEGIN{FS=":"}{print $1}'` &> ${TMPLOGHOME}/proteus-debs-md5-mismatched.txt
+
+	# listing of the dir
+	ls -al /data/notify/incoming > ${TMPLOGHOME}/data-notify-incoming-listing.txt 2>&1
+
+	# listing of the /data/discovery directory
+	ls -al /data/discovery > ${TMPLOGHOME}/data-discovery-listing.txt 2>&1
+
+	# ifconfig output
+	ifconfig > ${TMPLOGHOME}/ifconfig.txt 2>&1
+
+	# checksum of crucial files
+	echo "Generating checksum information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	local proteusfileList="/opt/server/proteus/webapps/*.war"
+	${NICENESS} $md5sum ${proteusfileList} > ${TMPLOGHOME}/md5.txt 2>&1
+	ls -al ${proteusfileList} > ${TMPLOGHOME}/ls-al.txt 2>&1
+
+    # Get number of backup files and size
+    if [[ -d /data/backup ]]
+    then
+		printf -- "Backup configuration\n---------------------------------------------------------------------------\n" >> ${TMPLOGHOME}/backup-info.txt 2>&1
+		/usr/local/bin/clish -c "show backup" >> ${TMPLOGHOME}/backup-info.txt 2>&1
+		printf -- "---------------------------------------------------------------------------\n" >> ${TMPLOGHOME}/backup-info.txt 2>&1
+		printf -- "Backup status\n---------------------------------------------------------------------------\n" >> ${TMPLOGHOME}/backup-info.txt 2>&1
+		/usr/local/bin/clish -c "show backup status" >> ${TMPLOGHOME}/backup-info.txt 2>&1
+		printf -- "---------------------------------------------------------------------------\n" >> ${TMPLOGHOME}/backup-info.txt 2>&1
+        echo "Getting number of backup files ..."
+        DUSH=$(du -sh /data/backup)
+        df -h /data > ${TMPLOGHOME}/backup-info.txt 2>&1
+        echo "---------------------------------------------------------------------------" >> ${TMPLOGHOME}/backup-info.txt 2>&1
+        printf "Total backup size: ${DUSH}\n" >> ${TMPLOGHOME}/backup-info.txt 2>&1
+        echo "---------------------------------------------------------------------------" >> ${TMPLOGHOME}/backup-info.txt 2>&1
+        ls -l /data/backup >> ${TMPLOGHOME}/backup-info.txt 2>&1
+    fi
+
+    # Get Database size
+    if [[ -d /data/pgdata ]]
+    then
+        echo "Getting database size ..."
+        psql -U postgres -c "SELECT pg_database.datname,pg_size_pretty(pg_database_size(pg_database.datname)) AS size FROM pg_database where datname='proteusdb'" > ${TMPLOGHOME}/size-database.txt 2>&1
+    fi
+
+    # BAM size pna
+    printf "Total number of PNA files: " > ${TMPLOGHOME}/size-pna.txt 2>&1
+    ls -1 /data/notify/incoming | wc -l >> ${TMPLOGHOME}/size-pna.txt 2>&1
+    echo "---------------------------------------------------------------------------" >> ${TMPLOGHOME}/size-pna.txt 2>&1
+    du -sh /data/notify/incoming >> ${TMPLOGHOME}/size-pna.txt 2>&1
+
+    # Postgres Control Data
+	printf "Collecting Postgres control data ...\n"
+	su - postgres -c "pg_controldata -D /data/pgdata/;" > ${TMPLOGHOME}/pg_controldata.txt 2>&1
+
+	# Files in pgdata not owned by postgres user
+	rogue_files=$(find /data/pgdata ! -user postgres | wc -l)
+	if [[ ${rogue_files} -gt 0 ]]
+	then
+	    find /data/pgdata ! -user postgres -exec ls -l '{}' \; > ${TMPLOGHOME}/rogue_pgdata_files.txt 2>&1
+	fi
+
+	# postgres statistics
+	capturePGStats
+
+	# check if PortalGroup exists
+	verifyGatewayUDF PortalGroup
+	verifyGatewayUDF BlueCatGateway
+
+	# BAM thread dumps
+	if [ -e "/usr/local/bluecat/bamthreaddump.sh" ]; then
+		echo "Generating BAM thread dump ..." | tee -a ${TMPLOGHOME}/datarake.log
+		/usr/local/bluecat/bamthreaddump.sh > ${TMPLOGHOME}/bamthreaddump.txt 2>&1
+	else
+		echo "Missing bamthreaddump.sh" > ${TMPLOGHOME}/bamthreaddump.txt 2>&1
+	fi
+
+	# java heap mon
+	if [ -e "/usr/local/bluecat/javaheapmon.sh" ]; then
+		echo "Generating Java heap information ..." | tee -a ${TMPLOGHOME}/datarake.log
+		/usr/local/bluecat/javaheapmon.sh > ${TMPLOGHOME}/javaheapmon.txt 2>&1
+	else
+		echo "Missing javaheapmon.sh" > ${TMPLOGHOME}/javaheapmon.txt 2>&1
+	fi
+
+    # Get BAM PID
+    # 9.x PID can be obtained through a wrapper script
+    if [[ -e /opt/server/proteus/bam ]]
+    then
+	    bampid=`/opt/server/proteus/bam pid`
+    else
+        bampid=`ps -w -w -ef | grep -i -- "-jar /opt/jetty/start.jar" | grep -v grep | awk '{print $2}'`
+    fi
+
+	if [[ ! -z "${bampid}" ]] && [[ ! "${bampid}" == "No known BAM process is running." ]]; then
+		# send a QUIT signal to BAM java process so it dumps the threads to the logs
+		kill -QUIT ${bampid}
+		captureHeapDump "${bampid}"
+	else
+		echo "WARNING: Could not find BAM java PID. Not running? " | tee -a ${TMPLOGHOME}/datarake.log
+	fi
+
+	# generate the checksum of the content of proteus.ear
+	if [ "EXTEND" == "yes" ]; then
+		echo "Generating JAR checksum information ..." | tee -a ${TMPLOGHOME}/datarake.log
+		local TMPEAR=/tmp/proteus-ear
+		test -e ${TMPEAR} && rm -rf ${TMPEAR}
+		mkdir ${TMPEAR}
+		cp -f /opt/server/proteus/lib/ext/* ${TMPEAR}
+		local earjarfiles=`find ${TMPEAR} -type f -name "proteus-*.?ar" -o -type f -name "adonis-*.?ar"`
+		for jarfile in ${earjarfiles}
+		do
+			extractjar ${jarfile}
+		done
+		cd ${TMPEAR}
+		find . -type f -exec $md5sum {} \; > ${TMPLOGHOME}/proteusear-md5.txt 2>&1
+		rm -rf ${TMPEAR}
+	fi
+
+	# generate report for duplicate entities and orphan db records
+	if [ -e "/usr/local/bluecat/report_unresolved_references.sh" ]; then
+		echo "Generating report for duplicate entities and orphan db records..." | tee -a ${TMPLOGHOME}/datarake.log
+		/usr/local/bluecat/report_unresolved_references.sh -l Count > ${TMPLOGHOME}/duplicate_orphan_data.txt 2>&1
+	else
+		echo "Missing report_unresolved_references.sh" > ${TMPLOGHOME}/duplicate_orphan_data.txt 2>&1
+	fi
+
+	# If BAM extended report or DB analyze was requested via command-line
+	# flag, run it.
+	if [[ "$optionDoBAMAnalyze" -eq 1 ]]; then
+	    # the bam_analyze contains the extended report, so we run it only
+	    bam_analyze
+	elif [[ "$optionDoBAMExtendedReport" -eq 1 ]]; then
+	    echo "Collecting the BAM extended report  ..."
+	    bam_extended_report
+	fi
+
+	bam_replication_prompt
+
+	printf "Collecting replication status ...\n"
+	/usr/local/bluecat/replicationStatus.sh > ${TMPLOGHOME}/replicationStatus.txt
+	if [[ -f /data/pgdata/replication.conf ]]
+	then
+	    psql -U postgres -d postgres -c "select *  from pg_replication_slots;" > ${TMPLOGHOME}/pg_replslot.txt 2>&1
+	    printf "\n----- ----- ----- ----- ----- ----- ----- ----- ----- -----\n" >> ${TMPLOGHOME}/pg_replslot.txt
+
+	    grep -q slave_dbs /data/pgdata/replication.conf
+	    if [[ $? -eq 0 ]]
+	    then
+	        ls -ltr /data/pgdata/pg_replslot >> ${TMPLOGHOME}/pg_replslot.txt 2>&1
+	        printf "\n----- ----- ----- ----- ----- ----- ----- ----- ----- -----\n" >> ${TMPLOGHOME}/pg_replslot.txt
+	        for slot in $(ls -1 /data/pgdata/pg_replslot/)
+	        do
+	            if [[ ! -z ${slot} ]]
+	            then
+	                du -sh /data/pgdata/pg_replslot/* >> ${TMPLOGHOME}/pg_replslot.txt
+	            fi
+	        done
+	    fi
+	fi
+	### end -- collect replication status & slot(s) info -- chigh
+
+    if [[ -d /data/pgdata/pg_xlog ]]
+    then
+	    printf "Collecting transaction log data ...\n"
+	    printf "pg_xlog size: " > ${TMPLOGHOME}/pg_xlog.txt
+	    du -sh /data/pgdata/pg_xlog >> ${TMPLOGHOME}/pg_xlog.txt
+	    printf "\n----- ----- ----- ----- ----- ----- ----- ----- ----- -----\n" >> ${TMPLOGHOME}/pg_xlog.txt
+	    printf "\npg_xlog file info:\n" >> ${TMPLOGHOME}/pg_xlog.txt
+	    ls -ltr /data/pgdata/pg_xlog | tee -a ${TMPLOGHOME}/pg_xlog.txt | sed '/^total [0-9]/d' | wc -l >> ${TMPLOGHOME}/pg_xlog.txt
+    else
+        printf "no transaction log data (>= 9.3)\n" > ${TMPLOGHOME}/pg_xlog.txt
+    fi
+}
+
+# gather the generic BlueCat Networks specific information for -l parameter
+bcnInfoBasic()
+{
+	# checksum of crucial files
+	echo "Generating checksum information ..." | tee -a ${TMPLOGHOME}/datarake.log
+	local bcnfileList="/usr/local/bluecat/"
+	if [ -e "${bcnfileList}" ]; then
+		find ${bcnfileList} -type f -exec $md5sum {} \; > ${TMPLOGHOME}/md5.txt 2>&1
+		find ${bcnfileList} -exec ls -al {} \; > ${TMPLOGHOME}/ls-al.txt 2>&1
+	fi
+}
+
+# gather the default specific information for -j or -a or -s or no parameters
+bcnInfoAdditional()
+{
+	bcnInfoBasic
+
+	# Firewall status
+	echo "Firewall ..." | tee -a ${TMPLOGHOME}/datarake.log
+	iptables -nL > ${TMPLOGHOME}/iptables-nL.txt 2>&1
+	# Only run -t nat if conntrack is already active, otherwise it will start tracking connections
+	# and could cause performance issues
+	[ -f "/proc/net/nf_conntrack" ] && CONNTRACK_ACTIVE=$(head -1 /proc/net/nf_conntrack)
+	if [ ! -z "${CONNTRACK_ACTIVE}" ]; then
+		iptables -nL -t nat > ${TMPLOGHOME}/iptables-nL-tnat.txt 2>&1
+	else
+		echo "Skipped running 'iptables -t nat' to avoid activating conntrack" > ${TMPLOGHOME}/iptables-nL-tnat.txt 2>&1
+	fi
+}
+
+# Captures Postgres database statistics
+capturePGStats()
+{
+	echo "Collecting postgres database statistics..." | tee -a ${TMPLOGHOME}/datarake.log
+
+	local postgresStatsLogDir=/var/log/diag/pg_stats
+	mkdir -p $postgresStatsLogDir
+
+	local outputFile=${postgresStatsLogDir}/pg_stat_${DATESTART}.csv
+	psql -U postgres -d proteusdb -A -F "," -o $outputFile -c "SELECT * FROM pg_stat_activity;"
+
+	outputFile=${postgresStatsLogDir}/pg_lock_${DATESTART}.csv
+	psql -U postgres -d proteusdb -A -F "," -o $outputFile -c "SELECT * FROM pg_locks;"
+}
+
+systemstats(){
+    # Runs several long-running commands in parallel.
+    # Waits on all background jobs to finish.
+    # Output directly to files
+    local n=10 jobpid
+    echo "Running vmstat/iostat/mpstat for $n seconds ..."
+    iostat -xkd 1 $n | awk '{now=strftime("%Y-%m-%d %T %z "); print now $0}' > ${TMPLOGHOME}/iostat-xkd.txt 2>&1 &
+    vmstat -nw -S k 1 $n | awk '{now=strftime("%Y-%m-%d %T %z "); print now $0}' > ${TMPLOGHOME}/vmstat-nwSk.txt 2>&1 &
+    # CPU core usage information
+    mpstat -P ALL 2 5 > ${TMPLOGHOME}/mpstat_cpu_core_usage.txt 2>&1 &
+
+    if [[ "$optionDoProcReport" -eq 1 ]]; then
+        proc_report &
+    fi
+
+    for jobpid in `jobs -p`
+    do
+        echo "Waiting for background job $jobpid  ..."
+        wait $jobpid
+    done
+
+    vmstat -s > ${TMPLOGHOME}/vmstat-s.txt 2>&1
+    vmstat -D > ${TMPLOGHOME}/vmstat-D.txt 2>&1
+}
+
+grab_pna_samples(){
+    # Find the oldest and the most recent PNA file, and copy them to the
+    # datarake output.
+    if [[ -d /var/bluecat/notify/spool ]]; then
+        oldest=$(find /var/bluecat/notify/spool/  -type f -printf '%T+ %p\n' | sort | head -n 1 | awk '{print $2}')
+        newest=$(find /var/bluecat/notify/spool/  -type f -printf '%T+ %p\n' | sort | tail -n 1 | awk '{print $2}')
+        if [ -e "$oldest" -a -e "$newest" ]; then
+            echo "Grabbing the oldest and most recent PNA files ..."
+            cp "$oldest" "${TMPLOGHOME}/oldest_$(basename $oldest)"
+            cp "$newest" "${TMPLOGHOME}/newest_$(basename $newest)"
+        else
+            echo "No PNA files exist  ..."
+        fi
+    fi
+}
+
+psmclient_extended(){
+    # Runs read-only PsmClient commands.
+    # Output to stdout
+    local PsmClient=/usr/local/bluecat/PsmClient
+    echo "# node get"
+    $PsmClient node get
+    echo "# ntp get"
+    $PsmClient ntp get
+    echo "# snmp get"
+    $PsmClient '{"destination": "snmp", "operation": "get"}'
+    echo "# network/interfaces get"
+    $PsmClient '{"destination":"network/interfaces","operation":"get"}'
+    echo "# network/routes get"
+    $PsmClient '{"destination":"network/routes","operation":"get"}'
+    echo "# system get"
+    $PsmClient system get
+    echo "# services in manual override"
+    $PsmClient node get manual-override
+}
+
+psmclient_extended_adonis(){
+    # Runs read-only PsmClient commands.
+    local PsmClient=/usr/local/bluecat/PsmClient
+    echo "# custom firewall rules"
+    $PsmClient firewall get rule-id=custom
+    echo "# services in manual override"
+    $PsmClient node get manual-override
+    echo "# gateway get"
+    $PsmClient '{"destination":"gateway","operation":"get"}'
+}
+
+find_custom_cronjobs(){
+    # Do some poking around to find any non-standard cronjobs the customer may
+    # have installed.
+    # Output to stdout
+    local path filename
+    find /etc/cron.* -type f | while read path; do
+        filename=$(basename "$path")
+        case $filename in
+            .placeholder|apt|bsdmainutils|cracklib-runtime|cron.allow|csync|\
+                csync2|debsums|dpkg|logrotate|man-db|mem-mon|ntp|passwd|sysstat|\
+                aptitude|exim4-base|apt-compat|javaheapmon)
+            : ;;
+            *)
+                echo "Custom script detected in cron directories: '$path'"
+                echo "### Script contents follow:"
+                cat $path
+                echo -e "### End of script contents\n\n"
+                ;;
+        esac
+    done
+    find /var/spool/cron/ -type f | while read path; do
+        echo "User-installed crontab detected: '$path'"
+        echo "### Crontab contents follow:"
+        cat $path
+        echo -e "### End of crontab contents\n\n"
+    done
+}
+
+xha_hostname_to_ip(){ # Expects @hostname argument
+    # Translates xHA @hostname to an IP address in decimal format.
+    local hostname="$1"
+    local o1=$(cut -c2-3 <<< $hostname) \
+          o2=$(cut -c4-5 <<< $hostname) \
+          o3=$(cut -c6-7 <<< $hostname) \
+          o4=$(cut -c8-9 <<< $hostname)
+    for oct in $o1 $o2 $o3 $o4; do
+        ipaddr+="$((16#$oct))."
+    done
+    echo ${ipaddr%?}
+}
+
+xha_prompt(){
+    # If server is a member of xHA cluster, display a message on-screen
+    # reminding the user to collect a datarake from the other node.
+    # Output to stdout
+    if [[ $(/usr/local/bluecat/diagnoseHA.sh | awk -F "=" '/heartbeat-status/ {print $2}') == "running" ]]; then
+        peername=$(awk '/^node/ {print $2}' /etc/heartbeat/ha.cf | grep -v $(uname -n))
+        peerip=$(xha_hostname_to_ip $peername)
+        echo -e "\e[4mThis server is part of an xHA server cluster.\e[0m"
+        echo -e "\e[4mPlease make sure to collect a datarake also from the peer node, '$peerip'\e[0m"
+    fi
+}
+
+
+dhcp_failover_peer_prompt(){
+	# If DHCP is a failover peer, display an on-screen message reminding
+	# the user to collect a datarake from the other peer(s)
+	# Output to stdout
+	peer_list=$(awk '/peer address/ {print $3}' /etc/dhcpd.conf| sed -e 's#;##g')
+	if [ ! -z "${peer_list}" ]; then
+		echo -e "\e[4mThis DHCP server has failover peers.\e[0m"
+		echo -n -e "\e[4mPlease make sure to collect a datarake also from the peer node(s):"
+		for peer_ip in ${peer_list}
+		do
+			echo -n " ${peer_ip}"
+		done
+		echo -e "\e[0m"
+	fi
+}
+
+
+bam_replication_prompt(){
+	# If BAM is part of a replication set, display an on-screen message reminding
+	# the user to collect a datarake from the other peer(s)
+	# Output to stdout
+	BAM_IP=$(/sbin/ifconfig eth0 | awk '/inet / {print $2}')
+	replication_servers=$(/home/replication/bcn_local_cluster_data_as_root -l | json_pp | grep '"ip"' |\
+		awk -F\" '{print $4}' | grep -v ${BAM_IP})
+	if [ ! -z "${replication_servers}" ]; then
+		echo -e "\e[4mThis BAM server is part of a replication cluster.\e[0m"
+		echo -n -e "\e[4mPlease make sure to collect a datarake also from the peer node(s):"
+		for peer_ip in ${replication_servers}
+		do
+			echo -n " ${peer_ip}"
+		done
+		echo -e "\e[0m"
+	fi
+}
+
+verifyGatewayUDF()
+{
+	udf=$1
+    echo "Checking if ${udf} UDF exists..." | tee -a ${TMPLOGHOME}/datarake.log
+
+    query="SELECT timestamp \
+           FROM history HI \
+           INNER JOIN metadata_field_history MFI ON HI.id = MFI.history_id \
+           INNER JOIN metadata_field MF ON MFI.id = MF.id \
+           WHERE MF.name = '${udf}' AND MFI.transaction_type = 'I';"
+
+    timeStamp=$(psql -U postgres -d proteusdb -q -t -c "${query}");
+
+    if [[ -n "${timeStamp}" ]]; then
+        /bin/echo -e "${udf} UDF exists\\nCreated on ${timeStamp}" &>> ${TMPLOGHOME}/portal-info.txt;
+    else
+        echo "${udf} UDF does not exist" &>> ${TMPLOGHOME}/portal-info.txt;
+    fi
+}
+
+proc_report(){
+    # Enumerate virtually all files under /proc and display their contents.
+    # Output to file (proc_report.txt)
+    echo "Running the /proc report  ..." | awk '{now=strftime("%Y-%m-%d %T %z "); print now $0}'
+
+    find /proc/ -regextype posix-extended ! -regex '.*(kmsg|kcore|pagemap)' \
+         -type f -exec echo -e "\n# {}" \; -exec strings {} \; > ${TMPLOGHOME}/proc_report.txt 2>&1
+
+    echo "Done running the /proc report  ..." | awk '{now=strftime("%Y-%m-%d %T %z "); print now $0}'
+}
+
+
+postgres_health_info(){
+    # In-depth look at the running Postgres instance
+    # Output to stdout
+    local psql="psql -U postgres -d proteusdb"
+    echo "# lsof 2>/dev/null -b -u postgres"
+    lsof 2>/dev/null -b -u postgres
+    echo "# ps -ww -C postmaster,postgres -o pid,ppid,tty,lstart,vsz,rsz,share,etime,time,pcpu,pmem,args"
+    ps -ww -C postmaster,postgres -o pid,ppid,tty,lstart,vsz,rsz,share,etime,time,pcpu,pmem,args
+    echo "# psql ..."
+    $psql -e -c 'show all'
+    $psql -e -c '\du'
+    $psql -e -c 'select * from pg_stat_activity order by query_start, state'
+    $psql -e -c 'select * from pg_locks order by database, locktype, relation, mode, granted'
+    $psql -e -c 'select * from pg_stat_all_tables order by n_dead_tup, autovacuum_count, last_autovacuum'
+
+    $psql -e -c "SELECT psut.relname,
+     to_char(psut.last_vacuum, 'YYYY-MM-DD HH24:MI') as last_vacuum,
+     to_char(psut.last_autovacuum, 'YYYY-MM-DD HH24:MI') as last_autovacuum,
+     to_char(pg_class.reltuples, '9G999G999G999') AS n_tup,
+     to_char(psut.n_dead_tup, '9G999G999G999') AS dead_tup,
+     to_char(CAST(current_setting('autovacuum_vacuum_threshold') AS bigint)
+         + (CAST(current_setting('autovacuum_vacuum_scale_factor') AS numeric)
+            * pg_class.reltuples), '9G999G999G999') AS av_threshold,
+     CASE
+         WHEN CAST(current_setting('autovacuum_vacuum_threshold') AS bigint)
+             + (CAST(current_setting('autovacuum_vacuum_scale_factor') AS numeric)
+                * pg_class.reltuples) < psut.n_dead_tup
+         THEN '*'
+         ELSE ''
+     END AS expect_av
+ FROM pg_stat_user_tables psut
+     JOIN pg_class on psut.relid = pg_class.oid
+ ORDER BY 1;"
+}
+
+
+deployments_last_month(){
+    # Get deployments for the past month.
+    # Output to stdout
+    local psql="psql -U postgres -d proteusdb"
+    echo "# deployments in the past month"
+    $psql -c \
+"select id, version, timestamp, sourceid, sourcename, message, session_id, type, category, subcategory
+from event_log
+where timestamp > (localtimestamp - interval '31 days') and message like 'Deployment Finished%'
+order by timestamp DESC;"
+}
+
+
+history_table_info(){
+    # Run queries that calculate what percentage of data in history tables is
+    # comprised of dynamic data.
+    # Output to stdout.
+    local psql="psql -U postgres -d proteusdb"
+
+    # Starting from version 8.1.0, the structure of history tables has changed.
+    # The code below tests for the version of the system, and executes new
+    # style queries if the version is 8.*, but not 8.0.*.
+    if [ -x /usr/local/bluecat/versions.sh ]; then
+        local version=$(/usr/local/bluecat/versions.sh | awk '/Proteus:/ {print $2}')
+        if [[ "${version:0:3}" == "v8." ]] && [[ "${version:0:4}" != "v8.0" ]]; then
+            # Version 8.1 and higher
+            local year=$(date "+%Y") month=$(date "+%m")
+            local month_label="y${year}m${month}"
+
+            echo -e "## Ratios of dynamic data vs. all data in history tables\n"
+            echo "# per month history"
+            $psql -e -c "with allhist(count) as (select count(*)::float from history_${month_label}) , dynhist(count) as (select count(*)::float from history_${month_label} where comment in ( 'CLIENT:DHCPDynamicUpdater' , 'CLIENT:DNSDynamicAdd' , 'CLIENT:DNSDynamicDelete' , 'CLIENT:DNSDynamicUpdate' )) select dynhist.count / allhist.count from dynhist , allhist";
+
+            echo "# per month metadata_value history"
+            $psql -e -c "with allmetahist(count) as (select count(*)::float from metadata_value_history_${month_label}) , dynmetahist(count) as (select count(*)::float from metadata_value_history_${month_label} MH inner join history H on H.comment in ( 'CLIENT:DHCPDynamicUpdater' , 'CLIENT:DNSDynamicAdd' , 'CLIENT:DNSDynamicDelete' , 'CLIENT:DNSDynamicUpdate' ) and MH.history_id = H.id ) select dynmetahist.count / allmetahist.count from dynmetahist , allmetahist"
+
+            echo "# per month entity_rrs history"
+            $psql -e -c "with allentrrhist(count) as (select count(*)::float from entity_rrs_history_${month_label}) , dynentrrhist(count) as (select count(*)::float from entity_rrs_history_${month_label} RRH inner join history H on H.comment in ( 'CLIENT:DHCPDynamicUpdater' , 'CLIENT:DNSDynamicAdd' , 'CLIENT:DNSDynamicDelete' , 'CLIENT:DNSDynamicUpdate' ) and RRH.history_id = H.id ) select dynentrrhist.count / allentrrhist.count from dynentrrhist , allentrrhist"
+
+            echo "# all history"
+            $psql -e -c "with allhist(count) as (select count(*)::float from history) , dynhist(count) as (select count(*)::float from history where comment in ( 'CLIENT:DHCPDynamicUpdater' , 'CLIENT:DNSDynamicAdd' , 'CLIENT:DNSDynamicDelete' , 'CLIENT:DNSDynamicUpdate' )) select dynhist.count / allhist.count from dynhist , allhist";
+
+            echo "# all metadata_value history"
+            $psql -e -c "with allmetahist(count) as (select count(*)::float from metadata_value_history) , dynmetahist(count) as (select count(*)::float from metadata_value_history MH inner join history H on H.comment in ( 'CLIENT:DHCPDynamicUpdater' , 'CLIENT:DNSDynamicAdd' , 'CLIENT:DNSDynamicDelete' , 'CLIENT:DNSDynamicUpdate' ) and MH.history_id = H.id ) select dynmetahist.count / allmetahist.count from dynmetahist , allmetahist"
+
+        else
+            # Version 8.0 and lower
+
+            echo "# Ratio of dynamic data vs. all data in the 'history' table."
+            $psql -e -c "with allhist(count) as (select count(*)::float from history) , dynhist(count) as (select count(*)::float from history where comment in ( 'CLIENT:DHCPDynamicUpdater' , 'CLIENT:DNSDynamicAdd' , 'CLIENT:DNSDynamicDelete' , 'CLIENT:DNSDynamicUpdate' )) select dynhist.count / allhist.count from dynhist , allhist";
+
+            echo "# Ratio of dynamic data vs. all data in the 'metadata_value_history' table."
+            $psql -e -c "with allmetahist(count) as (select count(*)::float from metadata_value_history) , dynmetahist(count) as (select count(*)::float from metadata_value_history MH inner join history H on H.comment in ( 'CLIENT:DHCPDynamicUpdater' , 'CLIENT:DNSDynamicAdd' , 'CLIENT:DNSDynamicDelete' , 'CLIENT:DNSDynamicUpdate' ) and MH.history_id = H.id ) select dynmetahist.count / allmetahist.count from dynmetahist , allmetahist"
+        fi
+    else
+        echo "'/usr/local/bluecat/versions.sh' does not exist. Should exist on a BAM."
+    fi
+}
+
+
+run_vacuum_analyze_schema(){ # Expects @schema argument.
+    # Run ANALYZE (no VACUUM!) on @schema
+    [[ -z $1 ]] && echo "Error! Didn't get schema name."
+    local pguser=postgres dbname=proteusdb pgschema="$1" start end
+    local psql="psql -d $dbname -U $pguser" psql_tbls sed_str table_names tables_array
+    #  vacuum analyze only the tables in the schema named in the variable $pgschema
+    psql_tbls="\dt $pgschema.*"
+    sed_str="s/$pgschema\s+\|\s+(\w+)\s+\|.*/\1/p"
+    # extract schema table names from psql output and put them in a bash array
+    table_names=$(echo "$psql_tbls" | $psql | sed -nr "$sed_str")
+    tables_array=($(echo $table_names | tr '\n' ' '))
+    # loop through the table names creating and executing a vacuum command for each one
+    for t in "${tables_array[@]}"; do
+        start=$(date +"%s")
+        $psql -e  -c "ANALYZE VERBOSE $pgschema.$t;"
+        end=$(date +"%s")
+        echo "Duration: Analyzing $pgschema.$t took $(($end-$start)) seconds."
+    done
+}
+
+
+run_analyze(){
+    # Queries and workflow from John Lumby.
+    #
+    # First ANALYZE so that postgresql has current stats (may omit this if
+    # ANALYZE already run as part of some other regular process on same day)
+    # Output to stdout
+    local psql="psql -U postgres -d proteusdb"
+    run_vacuum_analyze_schema public
+    # then report
+    # tables:
+    $psql -e -c "select N.nspname , C.relname , C.oid , C.relpages from pg_class C , pg_namespace N where C.relnamespace = N.oid and N.nspname = 'public' and C.relname NOT like '%history%' and C.relname <> 'lease_summary' and relkind = 'r' order by C.relpages DESC"
+    $psql -e -c "select N.nspname , C.relname , C.oid , C.relpages from pg_class C , pg_namespace N where C.relnamespace = N.oid and N.nspname = 'deploy' and relkind = 'r' order by C.relpages DESC"
+    $psql -e -c "select N.nspname , C.relname , C.oid , C.relpages from pg_class C , pg_namespace N where C.relnamespace = N.oid and N.nspname = 'public' and C.relname like '%history%' OR C.relname = 'lease_summary' and relkind = 'r' order by C.relpages DESC"
+    # indexes :
+    $psql -c "select S.nspname as tbschema, T.relname as tbname, X.nspname as ixschema, N.relname as ixname, D.indisunique as isuniq, D.indisclustered as isclustered , D.indisprimary as ispkey , N.relpages from pg_class T, pg_class N, pg_index D, pg_namespace S,  pg_namespace X where T.oid = D.indrelid and N.oid = D.indexrelid and X.oid = N.relnamespace and S.oid = T.relnamespace and T.relkind = 'r' and N.relkind = 'i' order by N.relpages DESC";
+}
+
+
+db_size_info(){
+    # An in-depth look at DB size
+    # Output to stdout
+    local now=$(date -Iminutes) \
+	  proteusdb_size_in_bytes  \
+          psql="psql -U postgres -d proteusdb"
+    # [[ -z $db_size_alert_threshold ]] && local db_size_alert_threshold=99
+    proteusdb_size_in_bytes=$($psql -t -c "SELECT pg_database_size('proteusdb') FROM pg_database WHERE pg_database.datname = 'proteusdb'" | tr -d '[[:space:]]')
+    echo "proteusdb size in bytes: $proteusdb_size_in_bytes"
+    # if [[ "$proteusdb_size_in_bytes" -gt "$(( $db_size_alert_threshold * 1024 * 1024 * 1024))" ]]; then
+    #     send_snmp_trap "CRITICAL: proteusdb size is over ${db_size_alert_threshold}GB! (Size in bytes: $proteusdb_size_in_bytes) "
+    # fi
+    echo "All DBs:"
+    $psql -e -c "SELECT pg_database.datname,pg_size_pretty(pg_database_size(pg_database.datname)) AS size FROM pg_database"
+    echo "Relation size, from largest:"
+    $psql -e <<EOF
+SELECT
+    table_name,
+    pg_size_pretty(table_size) AS table_size,
+    pg_size_pretty(indexes_size) AS indexes_size,
+    pg_size_pretty(total_size) AS total_size
+FROM (
+    SELECT
+        table_name,
+        pg_table_size(table_name) AS table_size,
+        pg_indexes_size(table_name) AS indexes_size,
+        pg_total_relation_size(table_name) AS total_size
+    FROM (
+        SELECT ('"' || table_schema || '"."' || table_name || '"') AS table_name
+        FROM information_schema.tables
+    ) AS all_tables
+    ORDER BY total_size DESC
+) AS pretty_sizes
+;
+EOF
+}
+
+
+notifications_info(){
+    # Check the incoming notifications directory, and run "lsof" and "stat" on
+    # the PNA files.
+    # Output to stdout
+    echo "# ls -lrt /data/notify/incoming/"
+    ls -lrt /data/notify/incoming/
+    echo "find /data/notify/incoming -exec echo {} \;  -exec lsof {} \;"
+    find /data/notify/incoming -exec echo "# {}" \;  -exec lsof {} \; -exec stat {} \;
+    # find /data/notify/incoming -exec echo {} \;  -exec lsof {} \;
+}
+
+
+processes_info(){
+    # Run some handy "ps" commands.
+    # Output to stdout
+    echo "# ps -Ao pid,ppid,tty,lstart,vsz,rsz,share,etime,time,pcpu,pmem,args"
+    ps -Ao pid,ppid,tty,lstart,vsz,rsz,share,etime,time,pcpu,pmem,args
+    echo "# ps jaefxww"
+    ps jaefxww
+    echo "top -bn1"
+    top -bn1
+    echo "ps aux --sort -rss"
+    ps aux --sort -rss
+}
+
+collect_pg_metrics(){
+	# Collect db metrics/stats on pg user tables and indexes as well as replication info
+
+	local psql="psql -U postgres -d proteusdb"
+    # Monitor auto-vacuum
+    echo -e "### End of script contents\n\n"
+    $psql -e -c 'select * from pg_stat_user_tables'
+
+    $psql -e -c "SELECT psut.relname,
+     pg_class.reltuples AS rel_tup,
+     pg_class.relpages AS rel_pages,
+     psut.n_dead_tup AS dead_tup,
+     psut.n_live_tup AS live_tup,
+
+     CASE
+         WHEN  pg_class.relpages != 0
+         THEN pg_class.reltuples/pg_class.relpages
+         ELSE 0
+     END AS reltuples_div_relpages,
+
+     CASE
+         WHEN  psut.n_dead_tup + psut.n_live_tup != 0
+         THEN CAST(psut.n_dead_tup AS float)/CAST((psut.n_dead_tup + psut.n_live_tup) AS float)
+         ELSE 0
+     END AS percentage_deadtuples
+
+     FROM pg_stat_user_tables psut
+     JOIN pg_class on psut.relid = pg_class.oid
+		ORDER BY percentage_deadtuples DESC;"
+
+	$psql -e -c 'select * from pg_statio_user_tables'
+
+    # Monitor indexes/cache hits
+    $psql -e -c 'select * from pg_stat_user_indexes'
+    $psql -e -c 'select * from pg_statio_user_indexes'
+
+    # Monitor replication
+    $psql -e -c 'select * from pg_stat_replication'
+
+}
+
+
+bam_extended_report(){
+    # Note: May take as much as a minute or two to complete.
+    # Output to files only.
+    echo "Collecting the BAM extended report  ..."
+    postgres_health_info > ${TMPLOGHOME}/postgres_info.txt 2>&1
+    deployments_last_month > ${TMPLOGHOME}/deployments_last_month.txt 2>&1
+    db_size_info > ${TMPLOGHOME}/BAM_DB_size_info.txt 2>&1
+    notifications_info > ${TMPLOGHOME}/data_notify_incoming_detailed.txt 2>&1
+    processes_info > ${TMPLOGHOME}/ps_extended.txt 2>&1
+    collect_pg_metrics > ${TMPLOGHOME}/postgres_info_additional.txt 2>&1
+}
+
+
+bam_analyze(){
+    # Runs ANALYZE on the DB. Potentially intrusive.
+    # Output to files only.
+    echo "Running the BAM analyze workflow  ..."
+    run_analyze > ${TMPLOGHOME}/analyze_output.txt 2>&1
+    history_table_info > ${TMPLOGHOME}/history_table_info.txt 2>&1
+    bam_extended_report
+}
+
+
+# MAIN
+
+# more than two options, quit
+# -- deprecated as of ENG-25180, due to more options being introduced that can be used with [lsja]
+# if [ "$#" -gt 2 ]; then
+#	printhelp
+#	exit 1
+#fi
+
+option=s
+optionGetHeapDump=0
+optionComputeMD5Sums=0
+optionDoProcReport=0
+optionDoBAMExtendedReport=0
+optionDoBAMAnalyze=0
+
+while getopts "hlstjadmpxz" opt; do
+	case "${opt}" in
+		h)
+			printhelp
+			exit 1
+			;;
+		l)
+			option=l
+			;;
+		s)
+			option=s
+			;;
+		t)
+			option=t
+			;;
+		j)
+			option=j
+			;;
+		a)
+			option=a
+			;;
+		d)
+			optionGetHeapDump=1
+			;;
+		m)
+			optionComputeMD5Sums=1
+			;;
+		p)
+			optionDoProcReport=1
+			;;
+		x)
+			optionDoBAMExtendedReport=1
+			;;
+		z)
+			optionDoBAMAnalyze=1
+			;;
+
+	esac
+done
+
+# Disable computation of MD5 sums by default.
+if [[ "$optionComputeMD5Sums" -eq 1 ]]; then
+    echo "Computation of MD5 checksums is enabled  ..."
+    md5sum="$(which md5sum)"
+else
+    md5sum="$(which true)"
+fi
+
+echo "Datarake arguments: $@" > ${TMPLOGHOME}/datarake.log
+
+#Optionally delete old data package
+if [ -e /tmp/delete ]; then
+	archives=(	`find /tmp -name "bcn-support.*.tgz"`)
+	archCount=${#archives[@]}
+	archIndex=0
+	del=false
+	oldest="null"
+	if [ "$archCount" -gt 0 ]; then
+		oldest=${archives[0]}
+		del=true
+
+		while [ "$archIndex" -lt "$archCount" ]; do
+			let "archIndex = $archIndex + 1"
+			if test "${archives[$archIndex]}" -ot oldest
+			then
+				oldest="${archives[$archIndex]}"
+			fi
+		done
+	fi
+
+	if [ del ]; then
+		echo "Deleting $oldest ..." | tee -a ${TMPLOGHOME}/datarake.log
+		rm -f "$oldest"
+	fi
+fi
+
+# grab the product specific information
+case "$PRODUCT"	in
+ADONIS)
+	case "${option}" in
+		l)
+			commonInfoBasic
+			adonisInfoBasic
+			myfileList=( ${fileListLogOnly[@]} ${adonisListLogOnly[@]} )
+			;;
+		s)
+			commonInfoAdditional
+			adonisInfoAdditional
+			myfileList=( ${fileList[@]} ${adonisList[@]} ${adonisListReplicated[@]} )
+			;;
+		j)
+			commonInfoAdditional
+			adonisInfoAdditional
+			myfileList=( ${fileList[@]} ${adonisList[@]} ${fileListSecureOnly[@]} )
+			;;
+		a)
+			commonInfoAdditional
+			adonisInfoAdditional
+			myfileList=( ${fileList[@]} ${adonisList[@]} ${fileListSecureOnly[@]} ${adonisListReplicated[@]} )
+			;;
+		*)
+			commonInfoAdditional
+			adonisInfoAdditional
+			myfileList=( ${fileList[@]} ${adonisList[@]} ${fileListSecureOnly[@]} ${adonisListReplicated[@]} )
+			;;
+	esac
+
+	taroption=${adonistaroption}
+	;;
+PROTEUS)
+	case "${option}" in
+		l)
+			commonInfoBasic
+			proteusInfoBasic
+			myfileList=( ${fileListLogOnly[@]} ${proteusListLogOnly[@]} )
+			;;
+		s)
+			commonInfoAdditional
+			proteusInfoAdditional
+			myfileList=( ${fileList[@]} ${proteusList[@]} )
+			;;
+		a)
+			commonInfoAdditional
+			proteusInfoAdditional
+			myfileList=( ${fileList[@]} ${proteusList[@]} ${fileListSecureOnly[@]} )
+			;;
+		*)
+			commonInfoAdditional
+			proteusInfoAdditional
+			myfileList=( ${fileList[@]} ${proteusList[@]} ${fileListSecureOnly[@]} )
+			;;
+	esac
+
+	taroption=${bcntaroption}
+	;;
+AI)
+	case "${option}" in
+		l)
+			commonInfoBasic
+			bcnInfoBasic
+			myfileList=( ${fileListLogOnly[@]} )
+			;;
+		s)
+			commonInfoAdditional
+			bcnInfoAdditional
+			myfileList=( ${fileList[@]} )
+			;;
+		a)
+			commonInfoAdditional
+			bcnInfoAdditional
+			myfileList=( ${fileList[@]} ${fileListSecureOnly[@]} )
+			;;
+		*)
+			commonInfoAdditional
+			bcnInfoAdditional
+			myfileList=( ${fileList[@]} ${fileListSecureOnly[@]} )
+			;;
+	esac
+
+	taroption=${bcntaroption}
+	;;
+FLEET)
+	find /home/sdp/logs -iname '*.tgz' > $PREVIOUS_DATARAKES
+	tar_excludes="$tar_excludes --exclude-from $PREVIOUS_DATARAKES"
+	case "${option}" in
+		l)
+			echo Collecting logs-only SPv4 datarake
+			commonInfoBasic
+			fleetInfoBasic
+			myfileList=( ${fileListLogOnly[@]} ${fleetListLogOnly[@]} )
+			;;
+		t)
+			echo Collecting tiny SPv4 datarake, omitting /var/log/journal and large logs
+			find /var/log -size +10M > $BIG_FILES
+			tar_excludes="$tar_excludes --exclude /var/log/journal --exclude-from $BIG_FILES --exclude /var/state/dhcp"
+			commonInfoAdditional
+			fleetInfoBasic
+			myfileList=( ${fileList[@]} ${fleetList[@]} ${fileListSecureOnly[@]} ${fleetListReplicated[@]} )
+			;;
+		a)
+			echo Collecting detailed SPv4 datarake
+			commonInfoAdditional
+			fleetInfoAdditional
+			myfileList=( ${fileList[@]} ${fleetList[@]} ${fileListSecureOnly[@]} ${fleetListReplicated[@]} )
+			;;
+		*)
+			echo Collecting standard SPv4 datarake
+			commonInfoAdditional
+			fleetInfoAdditional
+			myfileList=( ${fileList[@]} ${fleetList[@]} ${fileListSecureOnly[@]} ${fleetListReplicated[@]} )
+			;;
+	esac
+
+	taroption=${fleettaroption}
+	;;
+*)
+	echo "Unsupported product, please contact BlueCat Networks support for further instructions."
+esac
+
+# verify that all the files exist
+count=${#myfileList[@]}
+index=0
+
+while [ "$index" -lt "$count" ]
+do
+  if [ -e ${myfileList[$index]} ]
+  then
+	echo "${myfileList[$index]} exists" >> ${TMPLOGHOME}/datarake.log
+	if [ ! -r "${myfileList[$index]}" ]
+	then
+		echo "${myfileList[$index]} cannot be read" >> ${TMPLOGHOME}/datarake.log
+		myfileList[$index]=""
+	else
+		find "${myfileList[$index]}" | while read file; do
+			if test \! -r "$file"; then
+				echo "$file cannot be read" >> ${TMPLOGHOME}/datarake.log
+			fi
+		done
+	fi
+  else
+	echo "${myfileList[$index]} does not exist" | tee -a ${TMPLOGHOME}/datarake.log ${TMPLOGHOME}/missing_file.txt 1>/dev/null
+	myfileList[$index]=""
+  fi
+  let "index = $index + 1"
+done
+
+# build the tarball of logs and information
+echo "Creating snapshot of the above information ..." | tee -a ${TMPLOGHOME}/datarake.log
+TARFAILCODE=$(${NICENESS} tar --hard-dereference ${taroption} --transform 's,^,'${TARBALLTOPDIR}',' ${tar_excludes:-} -Pzchf ${TARBALL} ${myfileList[@]} 2>&1 >/dev/null)
+rm -f $BIG_FILES
+
+if [ -e "${TARBALL}" ]; then
+	echo "${TARBALL} is created successfully"  >> ${TMPLOGHOME}/datarake.log
+else
+	echo "Data package creation failed with error code $TARFAILCODE." | tee -a  ${TMPLOGHOME}/datarake.log
+
+	echo "Please send the file /etc/datarake.log to the BlueCat Customer Care team for further analysis" | tee -a ${TMPLOGHOME}/datarake.log
+
+	cp ${TMPLOGHOME}/datarake.log /tmp/datarake.log
+	# clean up
+	rm -rf ${TMPLOGHOME}
+	rm -f ${HEAPDUMPDIR}/${HEAPDUMPFILENAME}
+
+	exit 1
+fi
+
+# clean up
+rm -rf ${TMPLOGHOME}
+rm -f ${HEAPDUMPDIR}/${HEAPDUMPFILENAME}
+
+# message to the customer
+echo "Please send the file ${TARBALL} to the BlueCat Customer Care team for further analysis."
+
+archives=(	`find /tmp -name "bcn-support.*.tgz"`)
+archCount=${#archives[@]}
+archIndex=0
+totalArchSize=0
+
+while [ "$archIndex" -lt "$archCount" ]
+do
+	filesize=$(stat -c%s "${archives[$archIndex]}")
+	let "totalArchSize = $totalArchSize + $filesize"
+	let "archIndex = $archIndex + 1"
+done
+if [ "$totalArchSize" -gt 24117248 ]
+then
+	megabytes=$((totalArchSize >> 20))
+	if [ -e /tmp/delete ]; then
+		echo "There are ${megabytes}MB of diagnostic data packages stored on this machine. Unless the file /tmp/delete is removed first, the next time the diagnostics collector is run, the data package with the oldest modification date will be deleted."
+	else
+		echo "There are ${megabytes}MB of diagnostic data packages stored on this machine. Because of disk space limitations, please consider moving some of them off-box or deleting them. If you would like datarake.sh to automatically delete the data package with the oldest modification date at the start of each run, please type in: touch /tmp/delete"
+	fi
+fi
+
+case `fleet version` in
+v4.7*|v4.6.2)
+    exit 0
+    ;;
+*)
+    # removed the cached hotfix, so we will pull down new versions in the future
+    (sleep 2; rm -f /home/operations/hotfixes/hotfix-datarake)
+    ;;
+esac

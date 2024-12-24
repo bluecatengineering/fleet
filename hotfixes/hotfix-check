@@ -1,4 +1,4 @@
-#!/bin/bash -u
+#!/bin/bash
 #
 # hotfix check
 # hotfix to check for possible issues on any SP (merge of reachability and warnings scripts)
@@ -45,8 +45,8 @@ checkVersions() {
         expectedBsldVersion=0.2.4-build.517907-54b04ff3
         expectedBsldChecksum=c31b777e6438be73bacc67bc9e5a5e3fc5b98a021d82005e568bc8c49e6ab832
         # version shipped in 4.6.0 -> 4.7.1 update and 4.7.1 installer
-        expectedBsldVersion2=0.2.4-build.523281-91a0cad6
-        expectedBsldChecksum2=3f189146fbf21a1feb1ec7d4aa26c52df6ceb268346528451b6e08f6275662c6
+        expectedBsldVersion2=0.2.4-build.524131-cd09e8ce
+        expectedBsldChecksum2=3bb45e02ac3886a50598b237c55e42b191466944a5fab25818181ea96a091217
         ;;
     v4.7.0)
         expectedBsldVersion=0.2.4-build.491289-ed287d2b
@@ -96,10 +96,10 @@ checkVersions() {
         ;;
     esac
 
-    if ! test $bsldVersion = $expectedBsldVersion && ! test $bsldVersion = $expectedBsldVersion2; then
+    if ! test $bsldVersion = $expectedBsldVersion && ! test $bsldVersion = "$expectedBsldVersion2"; then
         echo alert: wrong BSLD version: $bsldVersion
     fi
-    if ! test $bsldChecksum = $expectedBsldChecksum && ! test $bsldChecksum = $expectedBsldChecksum2; then
+    if ! test $bsldChecksum = $expectedBsldChecksum && ! test $bsldChecksum = "$expectedBsldChecksum2"; then
         echo alert: wrong BSLD checksum: $bsldChecksum
     fi
 
@@ -128,17 +128,18 @@ checkForIssues() {
     addresses=`jq -r .addresses $TEMPF`
     jq -r .addresses $TEMPF | grep ipAddress | sed s/\"//g | sed s/,// | sed 's/ipAddress: //' > $TEMPF2
     addressesList=`cat $TEMPF2`
-    platform=`jq -r .platform $TEMPF`
-    resources=`hardware-resources -v | grep -v fleet/cluster | jq -r .resources`
-    totalMemory=`echo $resources  | jq -r .memory.totalMB`
-    cpuCores=`echo $resources  | jq -r .cpu.cores`
-    # echo resources: totalMemory: $totalMemory, cpuCores: $cpuCores, resources: $resources
+    platform=`fleet platform`
 
     if ! test -s $TEMPF; then
         echo alert: failed to get SP diagnostics
         status=UNKNOWN
         connectionStatus=UNKNOWN
         ntpSync=UNKNOWN
+    else
+        resources=`hardware-resources -v | grep -v fleet/cluster | jq -r .resources`
+        totalMemory=`echo $resources  | jq -r .memory.totalMB`
+        cpuCores=`echo $resources  | jq -r .cpu.cores`
+        # echo resources: totalMemory: $totalMemory, cpuCores: $cpuCores, resources: $resources
     fi
 
     case "$spVersion" in
@@ -157,6 +158,10 @@ checkForIssues() {
     fi
     problems --healthcheck | sed 's/^/errorCondition: /'
 
+    if ! test -s /opt/bluecat/bsld/conf/node.conf; then
+        echo hotfix-check will exit here because Service Point has not registered yet
+        exit 1
+    fi
     if ! test "$connectionStatus" = CONNECTED; then
         echo warning: SP connectionStatus: $connectionStatus
     fi
@@ -351,6 +356,24 @@ checkDeployedServices() {
     checkServiceIfDRS $serviceId $serviceName $serviceVersion
 }
 
+checkStarport() {
+    starportUrl=http://prod-us-east-1-starport-layer-bucket.s3.us-east-1.amazonaws.com/
+    # we test with the 2nd largest blob from https://service-layer.us.fleet.bluec.at:443/v2/library/bind9-sdp/manifests/1.0.104
+    dockerBlobUrl="https://service-layer.$fleetEnv.fleet.bluec.at:443/v2/library/bind9-sdp/blobs/sha256:c9fee890f0666f878a28a03ff77717ca6d7be6e09f90cbbd2828691762723c30"
+    # pass in "-L" to curl, so it will follow redirect to Amazon S3
+    elapsed=`time (with-proxy curl -L -A docker -s --max-time 5 \
+        --key /opt/bluecat/apt/etc/certs/managementKey.pem \
+        --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
+        --cacert $cacert "$dockerBlobUrl" > $TEMPF) 2>&1`
+
+    fileSize=`ls -l $TEMPF | awk '{print $5}'`
+    if test "$fileSize" -gt 1000; then
+        echoIfNotHealthcheck good response from S3 $starportUrl in $elapsed seconds of $fileSize bytes
+    else
+        echo warning: bad response from S3 $starportUrl in $elapsed seconds of $fileSize bytes
+    fi
+}
+
 trap cleanUpOnExit EXIT
 
 checkVersions
@@ -358,8 +381,9 @@ checkForIssues
 
 # cat reachability warnings > /tmp/checkup-new
 
-# TODO: we can delete the embedded reachability and warnings scripts after all customers update to > 4.7.1
-case "$spVersion" in
+# TODO: we can delete the embedded reachability and warnings scripts after all customers update to > 4.7.3
+# disabling this since we want to run startport checks always, until we fix the redirect bug in BSL-3438
+case xx"$spVersion" in
 v4.7.1|v4.7.2|v4.8.*)
     warnings
     reachability
@@ -376,6 +400,8 @@ esac
 # 4.7.0: improved error handling when the SP has not registered yet
 # 4.7.0: auto-discover the customer-subdomain and test connectivity to AWS Firehose
 # 4.7.1: refactor via shell functions to avoid exiting prematurely in case of errors
+# 4.7.3: report download bandwidth in Mbps, to be consistent with Edge documentation
+# 4.7.3: improve error handling when the SP has not registered yet
 
 usage() {
     echo 'usage: reachability [-v] [--healthcheck] [-e env] [-c customer-subdomain] [-r customer-region]'
@@ -476,7 +502,7 @@ esac
 
 checkFleetReachability() {
     pingUrl=https://service-layer.$fleetEnv.fleet.bluec.at/ping
-    elapsed=`time (with-proxy curl -s --max-time 5 \
+    elapsed=`time (with-proxy curl -s --show-error --max-time 5 \
         --key /opt/bluecat/apt/etc/certs/managementKey.pem \
         --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
         --cacert $cacert $pingUrl > $TMP) 2>&1`
@@ -498,7 +524,7 @@ checkFleetReachability() {
 
 checkNotaryReachability() {
     # TODO: we can delete this after all customers update to > 4.6.0
-    case $spVersion in
+    case `fleet version` in
     v4.4*|v4.5*)
         # old SP versions do not use Notary, so do not test those endpoints
         return
@@ -558,6 +584,9 @@ checkNotaryReachability() {
 checkCIReachability() {
     if test -z "$customerSubdomain"; then
         # try to derive CI domain from DRS-3.11 diagnostics
+        if ! test -e /opt/bluecat/bsld/conf/node_ips; then
+            return
+        fi
         exposedIP=`head -1 /opt/bluecat/bsld/conf/node_ips`
         curl -s -m 60 --noproxy $exposedIP http://${exposedIP}:2021/v2/diagnostics 2>/dev/null > $TMP
 
@@ -611,14 +640,14 @@ checkFirehoseReachability() {
     if test -n "$customerRegion"; then
         testURL=https://firehose.$customerRegion.amazonaws.com
 
-        elapsed=`time (with-proxy curl -s --max-time 5 $testURL > $TMP) 2>&1`
+        elapsed=`time (with-proxy curl -s --show-error --max-time 5 $testURL > $TMP) 2>&1`
         response=`cat $TMP`
         case $response in
             healthy)
                 echoIfNotHealthcheck "good response from Firehose $testURL in $elapsed seconds"
                 ;;
             *)
-                echo "warning: bad response from Firehose $testURL- got $response in $elapsed seconds"
+                echo "warning: bad response from Firehose $testURL - got $response in $elapsed seconds"
                 if test $verbose == true; then
                     with-proxy curl -v --max-time 5 $testURL
                 fi
@@ -632,7 +661,14 @@ checkNetworkBandwidth() {
     PKG=docker-ce-cli_5%3a24.0.7-1~debian.11~bullseye_amd64.deb
     URL_ENCODED=$URL/$(echo $PKG | tr -d '\n' | jq -sRr @uri)
 
-    elapsed=`time (with-proxy curl -s --max-time 15  \
+    if ! test -f /opt/bluecat/apt/etc/certs/managementCert.pem; then
+        echo warning: cannot test download speed without SP certs
+        rm -f $TMP
+        return
+    fi
+
+    # 20 second timeout is long enough for a rate of 5 Mbps
+    elapsed=`time (with-proxy curl -s --max-time 20  \
         --key /opt/bluecat/apt/etc/certs/managementKey.pem \
         --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
         --cacert $cacert $URL_ENCODED > $TMP) 2>&1`
@@ -651,24 +687,26 @@ checkNetworkBandwidth() {
             head -5 $TMP
         fi
         rm -f $TMP
+        return
     fi
 
     speedKB=$( awk "BEGIN { print int($fileSize/$elapsed)}" )
-    speedMB=$( awk "BEGIN { print $speedKB/1024 }" )
-    speedMBint=$( awk "BEGIN { print int($speedMB)}" )
+    speedMb=$( awk "BEGIN { print $speedKB/128 }" )
+    speedMbint=$( awk "BEGIN { print int($speedMb)}" )
 
     # echo elapsed: $elapsed seconds
     # echo fileSize: $fileSize KB
     # echo speed: $speedKB KB / sec
+    # echo speed: $speedMbint Mb / sec
 
-    if test $speedMBint = 0; then
+    if test $speedMbint = 0; then
         echo warning: failed to download speed test file from $URL_ENCODED
-    elif test $speedMBint -lt 10; then
-        echo warning: download speed of $speedMBint MB/second is too low and might result in unreliable behaviour
-    elif test $speedMBint -lt 20; then
-        echoIfNotHealthcheck acceptable download speed of $speedMBint MB/second
+    elif test $speedMbint -lt 50; then
+        echo warning: download speed of $speedMbint Mb/second is too low, recommended minimum bandwidth is 50 Mb/second
+    elif test $speedMbint -lt 100; then
+        echoIfNotHealthcheck acceptable download speed of $speedMbint Mb/second
     else
-        echoIfNotHealthcheck good download speed of $speedMBint MB/second
+        echoIfNotHealthcheck good download speed of $speedMbint Mb/second
     fi
 }
 
@@ -676,6 +714,7 @@ checkFleetReachability
 checkNotaryReachability
 checkCIReachability
 checkFirehoseReachability
+checkStarport
 checkNetworkBandwidth
 rm -f $TMP
 #!/bin/bash -u
@@ -689,6 +728,7 @@ rm -f $TMP
 # 4.6.2: warnings script was introduced
 # 4.7.0: BSL-3124 move customer-metrics check from problems to warnings script
 # 4.7.1: BSL-3352 warnings should not run checkNetworkInterfaces on BlueCat Gen5 appliances
+# 4.7.2: BSL-3421 DNS tests use timeout of 5 seconds
 
 export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
 TMP=/tmp/warnings.$USER.$$
@@ -751,7 +791,7 @@ checkNameservers() {
 
     if ! test x"$mgmtEndpoint" = x; then
         for nameServer in `grep nameserver /etc/resolv.conf | grep -v '#' | awk '{print $2}'`; do
-            answer=`dig +short +tries=2 +timeout=3 @$nameServer $mgmtEndpoint`
+            answer=`dig +short +tries=2 +timeout=5 @$nameServer $mgmtEndpoint`
             case "$answer" in
             *"connection timed out"*)
                 echo "warning: Fleet /etc/resolv.conf configured with broken nameserver: $nameServer"
@@ -770,7 +810,7 @@ checkCustomerMetrics() {
 }
 
 checkNameservers
-checkPartition / /var /svcVols/*
+checkPartition / /var /home /boot /tmp /svcVols/*
 checkCerts
 checkCustomerMetrics
 

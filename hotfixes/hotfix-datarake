@@ -574,9 +574,10 @@ fleetInfoBasic()
     apt list ---upgradable > ${TMPLOGHOME}/fleet-sw-upgradable.txt 2>&1
     hwinfo > ${TMPLOGHOME}/fleet-hwinfo.txt 2>&1
     problems -v > ${TMPLOGHOME}/fleet-problems.txt 2>&1
-	reachability > ${TMPLOGHOME}/fleet-reachability.txt 2>&1
+    reachability -v > ${TMPLOGHOME}/fleet-reachability.txt 2>&1
     vgdisplay > ${TMPLOGHOME}/fleet-volumes.txt 2>&1
     lvs > ${TMPLOGHOME}/fleet-lvs.txt 2>&1
+    ipvsadm -Ln > ${TMPLOGHOME}/fleet-ipvsadm.txt 2>&1
     fleet resources > ${TMPLOGHOME}/fleet-resources.txt 2>&1
     fleet info > ${TMPLOGHOME}/fleet-info.txt 2>&1
     hotfix check > ${TMPLOGHOME}/fleet-hotfix-check.txt 2>&1
@@ -648,6 +649,12 @@ fleetInfoAdditional()
     for alloc in $allocations; do
         echo "ALLOCATION $alloc ...." >> ${TMPLOGHOME}/fleet-nomad-allocs.txt
         nomad alloc status $alloc >> ${TMPLOGHOME}/fleet-nomad-allocs.txt 2>&1
+    done
+
+    containerIDs=`docker ps -qa`
+    for containerID in $containerIDs; do
+        echo "CONTAINER ID: $containerID ...." >> ${TMPLOGHOME}/fleet-docker-inspect.txt
+        docker inspect $containerID >> ${TMPLOGHOME}/fleet-docker-inspect.txt 2>&1
     done
 }
 

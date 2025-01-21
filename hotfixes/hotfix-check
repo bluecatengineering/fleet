@@ -7,16 +7,76 @@
 
 recommendedVersion=v4.7.1
 
+FLEET_ETC=/opt/bluecat/etc
+PLATFORM_FILE=$FLEET_ETC/platform.txt
+FLEET_SIZE_FILE=$FLEET_ETC/fleet-size.txt
+FLEET_DISKSIZE_FILE=$FLEET_ETC/fleet-diskGB.txt
+NODE_CONF_FILE=/opt/bluecat/bsld/conf/node.conf
+verbose=false
+
+if test $# -gt 0 && test $1 = "-v"; then
+    verbose=true
+fi
+
+set +u
+
+getSpVersion() {
+    if ! test -s $NODE_CONF_FILE; then
+        fleet originalVersion
+    else
+        sudo bsld --version | sed s/Version=/v/
+    fi
+}
+
+getSpCustomerId() {
+    if ! test -s $NODE_CONF_FILE; then
+        echo unknown
+    else
+        fleet customer
+    fi
+}
+
+getSpId() {
+    if ! test -s $NODE_CONF_FILE; then
+        echo unknown
+    else
+        fleet id
+    fi
+}
+
+getSpEnv() {
+    if ! test -s $NODE_CONF_FILE; then
+        sudo cloud-init query userdata | grep registration-key | awk '{print $1}' | sed s,https://service-layer.,, | sed s/.fleet.bluec.at//
+    else
+        fleet env
+    fi
+}
+
+applyHotfix() {
+    echo remediation: apply hotfix $1
+    echo internal reference: see JIRA https://bluecatnetworks.atlassian.net/browse/$2
+}
+
+applyUpdate() {
+    if test -z "$2"; then
+        echo warning: SP $spVersion has known issues. Recommend upgrade to $recommendedVersion
+    else
+        echo remediation: apply platform update to $1
+        echo internal reference: see JIRA https://bluecatnetworks.atlassian.net/browse/$2
+    fi
+}
+
 shift
 customerSubdomain=""
 customerRegion=""
-spVersion=`fleet version`
-customerID=`fleet customer`
-echo servicePointID: `fleet id`
+spVersion=`getSpVersion`
+spProxy=`fleet proxy`
+customerID=`getSpCustomerId`
+echo servicePointID: `getSpId`
 echo version: $spVersion
-echo platform: `fleet platform` env: `fleet env`
+echo platform: `fleet platform` env: `getSpEnv`
 echo customerID: $customerID
-echo proxy: `fleet proxy`
+echo proxy: $spProxy
 
 bsldVersion=`apt list --installed 2> /dev/null | grep sdp-bsld | grep -v sdp-bsld-src | cut -d ' ' -f2`
 bsldChecksum=`sha256sum /opt/bluecat/bsld/bin/bsld | awk '{print $1}'`
@@ -29,15 +89,43 @@ esac
 
 TEMPF=/tmp/cust-temp.$$.tmp
 TEMPF2=/tmp/cust-tmp.$$.tmp
+TEMPF3=/tmp/cust-tmp.$$.tmp3
 
 cleanUpOnExit() {
-    rm -rf $TEMPF $TEMPF2
+    rm -rf $TEMPF $TEMPF2 $TEMPF3
 }
 
 checkVersions() {
     expectedBslcVersion=""
     expectedBsldVersion2=""
     expectedBsldChecksum2=""
+
+    case "$spVersion" in
+    v4.4*|v4.5*)
+        echo alert: SP $spVersion is end of life. Recommend upgrade to $recommendedVersion
+        ;;
+    v4.6.0)
+        if test -n "$spProxy"; then
+            echo alert: EGW healthcheck broken on $spVersion if SP using a proxy
+            applyUpdate $recommendedVersion BSL-2859
+        else
+            applyUpdate $recommendedVersion
+        fi
+        ;;
+    v4.6.1)
+        docker images | grep nomad-parent-container > $TEMPF
+        if ! test -s $TEMPF; then
+            echo alert: nomad-parent-container docker image is missing
+            applyHotfix sp-repair PM-8793
+        fi
+        applyUpdate $recommendedVersion
+        ;;
+    v4.6.2)
+        ;;
+    v4.7.0)
+        applyUpdate $recommendedVersion
+        ;;
+    esac
 
     case "$spVersion" in
     v4.7.1)
@@ -113,7 +201,79 @@ checkVersions() {
     fi
 }
 
+checkDownloads() {
+    # TODO: add check for Debian packages later
+
+    mgmtEndpoint=`grep managementHttpsEndpoint /opt/bluecat/bsld/conf/node.conf  | awk '{print $2}' | sed s/\"//g | sed s/,//`
+    checkApp=$mgmtEndpoint:443/library/bind9-sdp
+    checkVer=1.0.104
+    checkImage=$checkApp:$checkVer
+
+    docker rmi $checkImage  > /dev/null 2>/dev/null
+    docker pull -q $checkImage > /dev/null 2>/dev/null
+    docker images | grep $checkApp | grep $checkVer > $TEMPF
+    if test -s $TEMPF; then
+        echo good docker pull for $checkImage
+        docker rmi $checkImage > /dev/null
+    else
+        echo alert: docker pull failed for $checkImage
+    fi
+}
+
+checkCloudInitNetworkConfig() {
+    grep '^nameserver' /etc/resolv.conf > $TEMPF
+    cp /dev/null $TEMPF2
+    cloudInitNameservers=`grep dns-nameservers /etc/network/interfaces.d/50-cloud-init | tail -1 | sed s/dns-nameservers//`
+    for nameserver in $cloudInitNameservers; do
+        echo nameserver $nameserver >> $TEMPF2
+    done
+    diff $TEMPF2 $TEMPF > $TEMPF3
+    if test -s $TEMPF3; then
+        echo alert: /etc/resolv.conf does not align with eth0 dns-nameservers in /etc/network/interfaces.d/50-cloud-init
+        if test $verbose == true; then
+            echo unexpected changes in /etc/resolv.conf:
+            cat $TEMPF3
+        fi
+    fi
+}
+
 checkForIssues() {
+    if ! test -s $NODE_CONF_FILE; then
+        echo alert: Service Point has not registered yet
+        grep POST /var/log/sdp/bsld/bsld-run.log > $TEMPF
+        if test -e /home/sdp/de-commisioned; then
+            echo This SP has been de-commisioned
+        elif test -s $TEMPF; then
+            echo Found registration attempts:
+            head -2 $TEMPF
+            tail -1 $TEMPF
+        else
+            echo No registration attempts found
+        fi
+        fleetApiHost=`$sudoCmd cloud-init query userdata  | grep registration-key | tr ' ' '\n' | grep https | sed s,https://,,`
+        if ! test -z $fleetApiHost; then
+            echo Testing DNS resolution of $fleetApiHost ...
+            dig +short +tries=2 +timeout=5 $fleetApiHost > $TEMPF
+            if grep "connection timed out" $TEMPF > /dev/null; then
+                echo Service Point cannot resolve IP address for $fleetApiHost
+                echo You must fix the nameserver entries in /etc/resolv.conf
+            else
+                echo Service Point is able to resolve IP address for $fleetApiHost as `cat $TEMPF`
+            fi
+
+            if test -n "$spProxy"; then
+                echo Service Point is using a proxy. Make sure proxy allows access to Fleet Management
+            fi
+
+            mgmtLayerPing=https://`echo $fleetApiHost | sed 's/service-layer.//'`/ping
+            echo Checking connectivitity to Fleet Management $mgmtLayerPing ...
+            with-proxy curl -s --show-error --max-time 10 $mgmtLayerPing
+        else
+            echo Could not find registration-endpoint
+        fi
+        exit 0
+    fi
+
     curl -s -m 60 --noproxy localhost http://localhost:8083/api/v1/diagnostics?full=false > $TEMPF
 
     servicePointID=`jq -r .id $TEMPF`
@@ -141,17 +301,6 @@ checkForIssues() {
         cpuCores=`echo $resources  | jq -r .cpu.cores`
         # echo resources: totalMemory: $totalMemory, cpuCores: $cpuCores, resources: $resources
     fi
-
-    case "$spVersion" in
-    v4.4*|v4.5*)
-        echo alert: SP $spVersion is end of life. Recommend upgrade to $recommendedVersion
-        ;;
-    v4.6.2)
-        ;;
-    v4.6*)
-        echo warning: SP $spVersion has known issues. Recommend upgrade to $recommendedVersion
-        ;;
-    esac
 
     if ! test "$status" = HEALTHY; then
         echo alert: SP status: $status
@@ -219,6 +368,10 @@ checkForIssues() {
     adminErrors=`grep -i error $logFile | wc -l`
     if test $adminErrors -gt 0; then
         echo alert: found $adminErrors errors in $logFile
+        if test $verbose == true; then
+            echo sample of errors in $logFile:
+            grep -i error $logFile | tail
+        fi
     fi
 
     componentDir=$logDir/nomad
@@ -267,6 +420,9 @@ checkForIssues() {
         grep proxy /var/log/sdp/admin.log
         ;;
     esac
+
+    checkCloudInitNetworkConfig
+    checkDownloads
 }
 
 checkServiceIfDRS() {
@@ -419,7 +575,6 @@ if test `whoami` = root; then
 	sudoCmd=""
 fi
 
-verbose=false
 healthcheck=false
 
 echoIfNotHealthcheck() {
@@ -714,7 +869,7 @@ checkFleetReachability
 checkNotaryReachability
 checkCIReachability
 checkFirehoseReachability
-checkStarport
+# checkStarport
 checkNetworkBandwidth
 rm -f $TMP
 #!/bin/bash -u

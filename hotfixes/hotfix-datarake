@@ -15,6 +15,9 @@
 # 4.7.0: collects output of 'hotfix sp-info', curl timout=60s for DRS diagnostics, biosdevname on bdds
 # 4.7.1: do not collect nomad allocations for '-t', support BlueCat Gen5 models
 # 4.7.2: EDG-15044 - Include DRS snapshots in datarake
+# 4.7.3: inspect each docker container, capture ipvsadmin & iptables-save, 'reachability -v', and exclude previous datarakes from new datarake
+
+set +u
 
 VERSION=4.7.1
 currentUser=`whoami`
@@ -533,9 +536,9 @@ fleetInfoBasic()
     fi
     if test -d /home/sdp/logs; then
         mkdir ${TMPLOGHOME}/fleet-home-sdp-logs
-	cd /home/sdp/logs
+        cd /home/sdp/logs
         find . -type f -not -iname '*.tgz' -exec cp --parents {} ${TMPLOGHOME}/fleet-home-sdp-logs/ \;
-	cd - > /dev/null
+        cd - > /dev/null
     fi
     egrep 'Notice|Error' /var/log/sdp/admin.log* > ${TMPLOGHOME}/fleet-admin-actions.txt 2>&1
 
@@ -578,6 +581,8 @@ fleetInfoBasic()
     vgdisplay > ${TMPLOGHOME}/fleet-volumes.txt 2>&1
     lvs > ${TMPLOGHOME}/fleet-lvs.txt 2>&1
     ipvsadm -Ln > ${TMPLOGHOME}/fleet-ipvsadm.txt 2>&1
+    iptables-save > ${TMPLOGHOME}/iptables-save.txt 2>&1
+    ip6tables-save > ${TMPLOGHOME}/ip6tables-save.txt 2>&1
     fleet resources > ${TMPLOGHOME}/fleet-resources.txt 2>&1
     fleet info > ${TMPLOGHOME}/fleet-info.txt 2>&1
     hotfix check > ${TMPLOGHOME}/fleet-hotfix-check.txt 2>&1

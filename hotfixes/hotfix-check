@@ -12,7 +12,6 @@ PLATFORM_FILE=$FLEET_ETC/platform.txt
 FLEET_SIZE_FILE=$FLEET_ETC/fleet-size.txt
 FLEET_DISKSIZE_FILE=$FLEET_ETC/fleet-diskGB.txt
 NODE_CONF_FILE=/opt/bluecat/bsld/conf/node.conf
-verbose=false
 
 if test $# -gt 0 && test $1 = "-v"; then
     verbose=true
@@ -67,8 +66,6 @@ applyUpdate() {
 }
 
 shift
-customerSubdomain=""
-customerRegion=""
 spVersion=`getSpVersion`
 spProxy=`fleet proxy`
 customerID=`getSpCustomerId`
@@ -213,7 +210,7 @@ checkDownloads() {
     docker pull -q $checkImage > /dev/null 2>/dev/null
     docker images | grep $checkApp | grep $checkVer > $TEMPF
     if test -s $TEMPF; then
-        echo good docker pull for $checkImage
+        echo info: good docker pull for $checkImage
         docker rmi $checkImage > /dev/null
     else
         echo alert: docker pull failed for $checkImage
@@ -221,19 +218,24 @@ checkDownloads() {
 }
 
 checkCloudInitNetworkConfig() {
-    grep '^nameserver' /etc/resolv.conf > $TEMPF
+    # note that if more than 3 nameservers are provided, they extra ones are ignored
+    grep '^nameserver' /etc/resolv.conf | head -3 > $TEMPF
     cp /dev/null $TEMPF2
     cloudInitNameservers=`grep dns-nameservers /etc/network/interfaces.d/50-cloud-init | tail -1 | sed s/dns-nameservers//`
     for nameserver in $cloudInitNameservers; do
         echo nameserver $nameserver >> $TEMPF2
     done
+    head -3 $TEMPF2 > $TEMPF3
+    cp $TEMPF3 $TEMPF2
     diff $TEMPF2 $TEMPF > $TEMPF3
     if test -s $TEMPF3; then
         echo alert: /etc/resolv.conf does not align with eth0 dns-nameservers in /etc/network/interfaces.d/50-cloud-init
-        if test $verbose == true; then
+        if test "$verbose" == true; then
             echo unexpected changes in /etc/resolv.conf:
             cat $TEMPF3
         fi
+    elif test "$verbose" == true; then
+        echo good: /etc/resolv.conf aligns with eth0 dns-nameservers in /etc/network/interfaces.d/50-cloud-init
     fi
 }
 
@@ -350,8 +352,6 @@ checkForIssues() {
         echo warning: insufficient cpu cores $cpuCores
     fi
 
-    checkDeployedServices $TEMPF
-
     lsof -n > $TEMPF 2>/dev/null
     fluentbitFileDescriptors=`grep fluentbit $TEMPF | wc -l`
     if test $fluentbitFileDescriptors -gt 6000; then
@@ -368,7 +368,7 @@ checkForIssues() {
     adminErrors=`grep -i error $logFile | wc -l`
     if test $adminErrors -gt 0; then
         echo alert: found $adminErrors errors in $logFile
-        if test $verbose == true; then
+        if test "$verbose" == true; then
             echo sample of errors in $logFile:
             grep -i error $logFile | tail
         fi
@@ -425,93 +425,6 @@ checkForIssues() {
     checkDownloads
 }
 
-checkServiceIfDRS() {
-    serviceId=$1
-    serviceName=$2
-    # TODO: we can simplify this after all customers update to > 4.6.0
-    case $spVersion in
-    v4.5*)
-        consul kv get -recurse descriptors/serviceInstance/$serviceId | sed "s/^.*$serviceId://" | jq > $TEMPF2
-        ;;
-    *)
-        fleet svc $serviceId > $TEMPF2
-        ;;
-    esac
-
-    if test "$serviceName" = dns-resolver-service; then
-        drsAddr=`jq -r .IngressEndpoints $TEMPF2 | jq -r .[0].Addresses | egrep -v ':|\[|\]' | sed s/\"//g | sed s/,// | head -1`
-        # echo DRS listen address: $drsAddr
-        drsDiagUrl=http://$drsAddr:2021/v2/diagnostics
-        curl -s $drsDiagUrl > $TEMPF2
-        if test -s $TEMPF2; then
-            status=`jq -r .status $TEMPF2`
-
-            if test "$status" = "BAD"; then
-                echo alert: DRS diagnostics reporting status: $status for $serviceName-$serviceVersion id: $serviceId
-                jq -r '.services[] | .id + ": " + .status'  $TEMPF2 | sed 's/^/    /'
-                jq -r .services[].resourceDetails $TEMPF2 | grep -v null | sed 's/^/    /'
-            else
-                echo info: DRS diagnostics reporting status: $status for $serviceName-$serviceVersion id: $serviceId
-            fi
-        else
-            echo alert: DRS diagnostics empty from $drsDiagUrl for $serviceName-$serviceVersion id: $serviceId
-        fi
-    fi
-}
-
-checkDeployedServices() {
-    if ! test -e /svcVols; then
-        return
-    fi
-
-    spFile=$1
-
-    serviceName=`jq -r '.services[0].serviceName' $spFile`
-    if test "$serviceName" = null; then
-        return	# no services deployed to this SP
-    fi
-    serviceId=`jq -r '.services[0].id' $spFile`
-    serviceErrors=`jq -r '.services[0].errorConditions' $spFile`
-    serviceVersion=`jq -r '.services[0].version' $spFile`
-    serviceStatus=`jq -r '.services[0].status' $spFile`
-    if test "$serviceStatus" = UNHEALTHY; then
-        echo alert: unhealthy service $serviceName-$serviceVersion id: $serviceId serviceErrors: $serviceErrors
-    else
-        echo info: healthy service $serviceName-$serviceVersion id: $serviceId
-    fi
-    checkServiceIfDRS $serviceId $serviceName $serviceVersion
-
-    serviceName=`jq -r '.services[1].serviceName' $spFile`
-    if test "$serviceName" = null; then
-        return	# no other services deployed to this SP
-    fi
-    serviceId=`jq -r '.services[1].id' $spFile`
-    serviceErrors=`jq -r '.services[1].errorConditions' $spFile`
-    serviceVersion=`jq -r '.services[1].version' $spFile`
-    serviceStatus=`jq -r '.services[1].status' $spFile`
-    if test "$serviceStatus" = UNHEALTHY; then
-        echo alert: unhealthy service $serviceName-$serviceVersion id: $serviceId serviceErrors: $serviceErrors
-    else
-        echo info: healthy service $serviceName-$serviceVersion id: $serviceId
-    fi
-    checkServiceIfDRS $serviceId $serviceName $serviceVersion
-
-    serviceName=`jq -r '.services[2].serviceName' $spFile`
-    if test "$serviceName" = null; then
-        return	# no other services deployed to this SP
-    fi
-    serviceId=`jq -r '.services[2].id' $spFile`
-    serviceErrors=`jq -r '.services[2].errorConditions' $spFile`
-    serviceVersion=`jq -r '.services[2].version' $spFile`
-    serviceStatus=`jq -r '.services[2].status' $spFile`
-    if test "$serviceStatus" = UNHEALTHY; then
-        echo alert: unhealthy service $serviceName-$serviceVersion id: $serviceId serviceErrors: $serviceErrors
-    else
-        echo info: healthy service $serviceName-$serviceVersion id: $serviceId
-    fi
-    checkServiceIfDRS $serviceId $serviceName $serviceVersion
-}
-
 checkStarport() {
     starportUrl=http://prod-us-east-1-starport-layer-bucket.s3.us-east-1.amazonaws.com/
     # we test with the 2nd largest blob from https://service-layer.us.fleet.bluec.at:443/v2/library/bind9-sdp/manifests/1.0.104
@@ -535,10 +448,11 @@ trap cleanUpOnExit EXIT
 checkVersions
 checkForIssues
 
-# cat reachability warnings > /tmp/checkup-new
+# cat warnings reachability > /tmp/checkup-new
+# diff /tmp/checkup-new hotfix-check
 
-# TODO: we can delete the embedded reachability and warnings scripts after all customers update to > 4.7.3
-# disabling this since we want to run startport checks always, until we fix the redirect bug in BSL-3438
+# TODO: we can delete the embedded reachability and warnings scripts after all customers update to >= 4.7.3 if we stop enhancing those scripts
+# disabling this with "xx" since we always want to use the scripts embedded below
 case xx"$spVersion" in
 v4.7.1|v4.7.2|v4.8.*)
     warnings
@@ -546,6 +460,336 @@ v4.7.1|v4.7.2|v4.8.*)
     exit 0
     ;;
 esac
+
+serviceInfo=true        # we want warnings to tell us about healthy services
+
+#!/bin/bash
+# sh options:
+# -e  Exit immediately if a command exits with a non-zero status
+# -u  Treat unset variables as an error when substituting
+#
+# warnings - warn about potential problems on an Edge Service Point
+#
+# Changes
+# 4.6.2: warnings script was introduced
+# 4.7.0: BSL-3124 move customer-metrics check from problems to warnings script
+# 4.7.1: BSL-3352 warnings should not run checkNetworkInterfaces on BlueCat Gen5 appliances
+# 4.7.2: BSL-3421 DNS tests use timeout of 5 seconds
+# 4.7.3: BSL-3510 improve tests performed by warnings script
+# 4.7.3: BSL-3560 refactored for easier sharing with hotfix-check, also added -s and -v flags
+
+export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
+TMP=/tmp/warnings.$USER.$$
+TMP2=/tmp/warnings2.$USER.$$
+
+healthcheck=false
+
+set +u
+
+checkPlatform() {
+    currentPlatform=`fleet platform`
+    case "$currentPlatform" in
+    bdds-vmware)
+        platformStatus=bad
+        ;;
+    vmware|aws|gce|azure|encs|nutanix|equinix|BlueCat-*|bdds*)
+        platformStatus=good
+        ;;
+    *)
+        platformStatus=bad
+        ;;
+    esac
+
+    if test $platformStatus = bad; then
+        echo "warning: SP platform is not supported: $currentPlatform"
+    fi
+}
+
+if test $# -gt 0; then
+    if test $1 = "--platform" ; then
+        # this flag is used by prepare-for-update
+		checkPlatform
+        exit 0
+	fi
+
+	if test $1 = "--healthcheck" || test $1 = "-h" ; then
+		healthcheck=true
+        shift
+	fi
+
+    if test "$1" = "-s" ; then
+        serviceInfo=true
+        shift
+    fi
+
+    if test "$1" = "-v" ; then
+        serviceInfo=true
+        verbose=true
+        shift
+    fi
+fi
+
+checkPartition() {
+    for partition in $*; do
+        if ! test -d $partition; then
+            continue
+        fi
+        percentFull=`df $partition | grep $partition | awk '{print $5}' | sed s/\%//`
+        if test $percentFull -gt 85; then
+            echo "alert: SP Disk partition $partition is $percentFull% full"
+        elif test $percentFull -gt 75; then
+            echo "warning: SP Disk partition $partition is $percentFull% full"
+        fi
+    done
+}
+
+checkCerts() {
+    localCerts=/usr/local/share/ca-certificates
+    ls -l $localCerts | egrep -v '^total|sdp-dev-server' > $TMP
+    lines=`wc -l $TMP | awk '{print $1}'`
+    if test $lines -ne 0; then
+        echo "warning: SP has non-standard certificates installed in $localCerts"
+        if test $healthcheck = false; then
+            cat $TMP
+        fi
+    fi
+}
+
+checkNetworkInterfaces() {
+
+    case `fleet platform` in
+    BlueCat-*|bdds*)
+        return
+        ;;
+    esac
+
+    interfaces=`ifconfig -a | grep flags | egrep -v 'dsr|veth|sdp|nomad|eth0|^lo|docker0'`
+    for interface in $interfaces; do
+        ifconfig $interface > $TMP 2>&1
+        lines=`wc -l $TMP | awk '{print $1}'`
+        if test $lines -ne 1; then
+            echo "warning: SP has non-standard network interface: $interface"
+            if test $healthcheck = false; then
+                cat $TMP
+            fi
+        fi
+    done
+}
+
+checkNameservers() {
+    CONFIG_FILE=/etc/resolv.conf
+    mgmtEndpoint=`grep managementHttpsEndpoint /opt/bluecat/bsld/conf/node.conf  | awk '{print $2}' | sed s/\"//g | sed s/,//`
+
+    grep '^nameserver' $CONFIG_FILE > $TMP
+    lines=`cat $TMP | wc -l`
+
+    if ! test x"$mgmtEndpoint" = x; then
+        workingCounter=0
+        for nameServer in `cat $TMP | grep -v '#' | awk '{print $2}'`; do
+            answer=`dig +short +tries=2 +timeout=5 @$nameServer $mgmtEndpoint`
+            case "$answer" in
+            *"connection timed out"*)
+                echo "warning: SP $CONFIG_FILE configured with non-responding nameserver: $nameServer"
+                ;;
+            *)
+                workingCounter=`expr $workingCounter + 1`
+                ;;
+            esac
+        done
+        if test $workingCounter -lt 2; then
+            echo "alert: SP $CONFIG_FILE configured with only $workingCounter functioning nameserver"
+        fi
+    else
+        echo "warning: SP managementHttpsEndpoint is unknown"
+    fi
+}
+
+checkCustomerMetrics() {
+    without-proxy curl -s http://localhost:8083/api/v1/metrics > $TMP
+    lines=`wc -l $TMP | awk '{print $1}'`
+    if test $lines -lt 200; then
+        echo "warning: SP customer-metrics service is not healthy"
+    fi
+}
+
+checkNTP() {
+    CONFIG_FILE=/etc/ntp.conf
+
+    ntpSynchronized=`fleet ntp | grep synchronized | awk '{print $2}'`
+    if ! test $ntpSynchronized = true; then
+        echo "warning: SP NTP service is not synchronized to a time source"
+    fi
+
+    grep '^pool' $CONFIG_FILE > $TMP
+    lines=`cat $TMP | wc -l`
+    if test $lines -lt 2; then
+        echo "warning: SP configured with only $lines NTP server"
+    fi
+}
+
+checkServiceIfDRS() {
+    serviceId=$1
+    serviceName=$2
+
+    if ! test "$serviceName" = dns-resolver-service; then
+        return
+    fi
+
+    source /home/operations/.bash_aliases
+    fleet svc $serviceId > $TMP2
+    curlTimeout=20
+
+    drsAddr=`jq -r .IngressEndpoints $TMP2 | jq -r .[0].Addresses | egrep -v ':|\[|\]' | sed s/\"//g | sed s/,// | head -1 | xargs`
+    if test -z "$drsAddr"; then
+        # fallback to using the primary IP address
+        drsAddr=`/usr/sbin/ifconfig eth0 | grep inet | grep -v inet6 | awk '{print $2}'`
+    fi
+    drsDiagUrl=http://$drsAddr:2021/v2/diagnostics
+    without-proxy curl -s --max-time $curlTimeout $drsDiagUrl > $TMP2
+    if test -s $TMP2; then
+        status=`jq -r .status $TMP2`
+
+        if test "$status" = "BAD"; then
+            drsErrors=`jq -r '.services[] | .id + ": " + .status'  $TMP2 | sed 's/^/    /' | grep BAD`
+            echo warning: DRS diagnostics reporting status $status for $serviceName $serviceVersion id $serviceId $drsErrors
+            if test "$serviceInfo" == true; then
+                jq -r '.services[] | .id + ": " + .status'  $TMP2 | sed 's/^/    /'
+                jq -r .services[].resourceDetails $TMP2 | grep -v null | sed 's/^/    /'
+            fi
+        elif test "$serviceInfo" == true; then
+            echo info: DRS diagnostics reporting status: $status for $serviceName-$serviceVersion id: $serviceId
+        fi
+    else
+        echo warning: DRS diagnostics empty from $drsDiagUrl for $serviceName $serviceVersion
+    fi
+}
+
+checkServiceInstance() {
+    if ! test -s $TMP2; then
+        return
+    fi
+
+    serviceName=`jq -r '.serviceName' $TMP2`
+    if test "$serviceName" = null || test "$serviceName" = ""; then
+        return
+    fi
+
+    serviceVersion=`jq -r '.version' $TMP2`
+	serviceStatus=`jq -r '.status' $TMP2`
+    serviceId=`jq -r '.id' $TMP2`
+
+    if test $serviceName = aegis; then
+        serviceName="Advanced Threat"
+    elif test $serviceName = edge-id-proxy; then
+        serviceName="Identity"
+    fi
+
+    if test "$serviceStatus" = UNHEALTHY; then
+        serviceErrors=`jq -r '.errorConditions' $TMP2`
+        echo warning: SP has unhealthy service instance: $serviceName $serviceVersion id $serviceId serviceErrors: $serviceErrors
+    elif test "$serviceInfo" == true; then
+        echo info: SP has healthy service instance: $serviceName $serviceVersion id $serviceId
+    fi
+    checkServiceIfDRS $serviceId $serviceName $serviceVersion
+}
+
+checkAnycastInterface() {
+    interfaceName=$1
+
+    if test -s $TMP2; then
+        isUp=`jq -r .isUp $TMP2`
+        ipAddress=`jq -r .ipAddress $TMP2`
+        if ! test $isUp = true; then
+            echo warning: SP Anycast interface $interfaceName $ipAddress is down
+        elif test "$verbose" == true; then
+            echo info: SP Anycast interface $interfaceName $ipAddress is up
+        fi
+    fi
+}
+
+checkDiagnostics() {
+    without-proxy curl -s -m 60 http://localhost:8083/api/v1/diagnostics > $TMP
+    if ! test -s $TMP; then
+        echo warning: SP diagnostics API is not responding
+        return
+    fi
+
+    updateStatus=`jq -r '.updateStatus' $TMP`
+    if ! test $updateStatus = OK; then
+        echo warning: SP updateStatus is $updateStatus
+    fi
+
+    # check all service instances
+    serviceInstanceCount=`jq -r '.services | length' $TMP`
+
+    current=0
+    while (test $current -lt $serviceInstanceCount)
+    do
+        jq -r ".services[$current]" $TMP > $TMP2
+        checkServiceInstance $TMP2
+        current=`expr $current + 1`
+    done
+
+    # check anycast interfaces and peers
+    anycast quickStatus > $TMP2
+    anycastStatus=`grep AnycastStatus $TMP2 | awk '{print $2}'`
+    # echo anycastStatus: $anycastStatus
+
+    case $anycastStatus in
+    disabled)
+        return
+        ;;
+    esac
+
+    anycastProtocol=`grep RoutingProtocol $TMP2 | awk '{print $2}'`
+    anycastInterfaceCount=`jq '.addresses | .[] | select(.interfaceName? // "" | startswith("lo"))' $TMP | grep isUp | wc -l`
+
+    current=1
+    while (test $current -le $anycastInterfaceCount)
+    do
+        anycastInterface=lo:$current
+        jq --arg field $anycastInterface '.addresses | map(select(.interfaceName == $field))' $TMP  | jq -r '.[0]' | grep -v null > $TMP2
+        checkAnycastInterface $anycastInterface
+        current=`expr $current + 1`
+    done
+
+    # echo anycastProtocol: $anycastProtocol
+    anycast peers > $TMP2
+
+    case $anycastProtocol in
+    ospf)
+        grep eth0 $TMP2 > $TMP
+        ;;
+    bgp)
+        grep 'BGP neighbor' $TMP2 > $TMP
+        ;;
+    esac
+
+    if ! test -s $TMP; then
+        echo warning: SP Anycast $anycastProtocol neighbours list is empty
+    elif test "$verbose" == true; then
+        echo info: SP Anycast $anycastProtocol neighbours list is healthy
+    fi
+}
+
+checkTelemetryAPI() {
+    checkCustomerMetrics
+    checkDiagnostics
+}
+
+checkNameservers
+checkPartition / /var /home /boot /tmp /svcVols/*
+checkPlatform
+checkNTP
+checkCerts
+checkTelemetryAPI
+checkNetworkInterfaces
+
+rm -f $TMP $TMP2
+
+if test $healthcheck = true; then
+    reachability --healthcheck
+fi
 
 #!/bin/bash
 # reachability - verifies a service point can reach all required cloud endpoints
@@ -666,7 +910,7 @@ checkFleetReachability() {
     expectedResponse="OK"
     if ! test "$response" = "$expectedResponse"; then
         echo warning: bad response from Fleet $pingUrl - expected $expectedResponse but got $response in $elapsed seconds
-        if test $verbose == true; then
+        if test "$verbose" == true; then
             with-proxy curl -v --max-time 5 \
             --key /opt/bluecat/apt/etc/certs/managementKey.pem \
             --cert /opt/bluecat/apt/etc/certs/managementCert.pem \
@@ -678,7 +922,6 @@ checkFleetReachability() {
 }
 
 checkNotaryReachability() {
-    # TODO: we can delete this after all customers update to > 4.6.0
     case `fleet version` in
     v4.4*|v4.5*)
         # old SP versions do not use Notary, so do not test those endpoints
@@ -700,7 +943,7 @@ checkNotaryReachability() {
         ;;
     *)
         echo warning: bad response from Notary-TLS $testUrl - expected $expectedResponse but got $response in $elapsed seconds
-        if test $verbose == true; then
+        if test "$verbose" == true; then
             with-proxy curl -v --max-time 5 $testUrl
         fi
         ;;
@@ -729,7 +972,7 @@ checkNotaryReachability() {
         ;;
     *)
         echo warning: bad response from Notary-mTLS $testUrl - expected $expectedResponse but got $response in $elapsed seconds
-        if test $verbose == true; then
+        if test "$verbose" == true; then
             with-proxy curl -v --max-time 5 --cert $notaryKey --key $notaryCert $testUrl
         fi
         ;;
@@ -770,7 +1013,7 @@ checkCIReachability() {
                 ;;
             *)
                 echo "warning: bad response from CI-mTLS $mtlsCustomerUrl - got $response in $elapsed seconds"
-                if test $verbose == true; then
+                if test "$verbose" == true; then
                     with-proxy curl -v --max-time 5 --cert $notaryKey --key $notaryCert $mtlsCustomerUrl
                 fi
                 ;;
@@ -803,7 +1046,7 @@ checkFirehoseReachability() {
                 ;;
             *)
                 echo "warning: bad response from Firehose $testURL - got $response in $elapsed seconds"
-                if test $verbose == true; then
+                if test "$verbose" == true; then
                     with-proxy curl -v --max-time 5 $testURL
                 fi
                 ;;
@@ -869,121 +1112,10 @@ checkFleetReachability
 checkNotaryReachability
 checkCIReachability
 checkFirehoseReachability
-# checkStarport
 checkNetworkBandwidth
 rm -f $TMP
-#!/bin/bash -u
-# sh options:
-# -e  Exit immediately if a command exits with a non-zero status
-# -u  Treat unset variables as an error when substituting
-#
-# warnings - warn about potential problems on an Edge Service Point
-#
-# Changes
-# 4.6.2: warnings script was introduced
-# 4.7.0: BSL-3124 move customer-metrics check from problems to warnings script
-# 4.7.1: BSL-3352 warnings should not run checkNetworkInterfaces on BlueCat Gen5 appliances
-# 4.7.2: BSL-3421 DNS tests use timeout of 5 seconds
 
-export PATH=$PATH:/opt/bluecat/bin:/usr/sbin
-TMP=/tmp/warnings.$USER.$$
-
-healthcheck=false
-
-echoIfNotHealthcheck() {
-    if test $healthcheck = false; then
-        echo $*
-    fi
-}
-
-if test $# -gt 0; then
-	if test $1 = "--healthcheck" || test $1 = "-h" ; then
-		healthcheck=true
-        shift
-	fi
-fi
-
-checkPartition() {
-    for partition in $*; do
-        if ! test -d $partition; then
-            continue
-        fi
-        percentFull=`df $partition | grep $partition | awk '{print $5}' | sed s/\%//`
-        if test $percentFull -gt 80; then
-            echo "warning: Disk partition $partition is $percentFull% full"
-        fi
-    done
-}
-
-checkCerts() {
-    localCerts=/usr/local/share/ca-certificates
-    ls -l $localCerts | egrep -v '^total|sdp-dev-server' > $TMP
-    lines=`wc -l $TMP | awk '{print $1}'`
-    if test $lines -ne 0; then
-        echo "warning: Non-standard certificates installed in $localCerts"
-        if test $healthcheck = false; then
-            cat $TMP
-        fi
-    fi
-}
-
-checkNetworkInterfaces() {
-    interfaces=`ifconfig -a | grep flags | egrep -v 'dsr|veth|sdp|nomad|eth0|^lo|docker0'`
-    for interface in $interfaces; do
-        ifconfig $interface > $TMP 2>&1
-        lines=`wc -l $TMP | awk '{print $1}'`
-        if test $lines -ne 1; then
-            echo "warning: Non-standard network interface found: $interface"
-            if test $healthcheck = false; then
-                cat $TMP
-            fi
-        fi
-    done
-}
-
-checkNameservers() {
-    mgmtEndpoint=`grep managementHttpsEndpoint /opt/bluecat/bsld/conf/node.conf  | awk '{print $2}' | sed s/\"//g | sed s/,//`
-
-    if ! test x"$mgmtEndpoint" = x; then
-        for nameServer in `grep nameserver /etc/resolv.conf | grep -v '#' | awk '{print $2}'`; do
-            answer=`dig +short +tries=2 +timeout=5 @$nameServer $mgmtEndpoint`
-            case "$answer" in
-            *"connection timed out"*)
-                echo "warning: Fleet /etc/resolv.conf configured with broken nameserver: $nameServer"
-                ;;
-            esac
-        done
-    fi
-}
-
-checkCustomerMetrics() {
-    curl -s http://localhost:8083/api/v1/metrics > $TMP
-    lines=`wc -l $TMP | awk '{print $1}'`
-    if test $lines -lt 200; then
-        echo "warning: Fleet SP customer-metrics service is not healthy"
-    fi
-}
-
-checkNameservers
-checkPartition / /var /home /boot /tmp /svcVols/*
-checkCerts
-checkCustomerMetrics
-
-case `fleet platform` in
-BlueCat-*|bdds*)
-	;;
-*)
-	checkNetworkInterfaces
-	;;
-esac
-
-rm -f $TMP
-
-if test $healthcheck = true; then
-    reachability --healthcheck
-fi
-
-# TODO: we can delete this after all customers update to > 4.6.0
+# TODO: we can delete this after all customers update to >= 4.6.2
 case $spVersion in
 v4.7*|v4.6.2)
     exit 0
